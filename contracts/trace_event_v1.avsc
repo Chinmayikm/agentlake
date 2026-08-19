@@ -1,0 +1,21 @@
+{
+  "type": "record",
+  "name": "TraceEvent",
+  "namespace": "agentlake.v1",
+  "fields": [
+    {"name": "trace_id", "type": "string"},
+    {"name": "span_id", "type": "string"},
+    {"name": "parent_span_id", "type": ["null", "string"], "default": null},
+    {"name": "session_id", "type": "string"},
+    {"name": "event_type", "type": {"type": "enum", "name": "EventType",
+      "symbols": ["LLM_CALL", "TOOL_CALL", "RETRIEVAL", "AGENT_STEP", "GATEWAY", "ERROR"]}},
+    {"name": "model", "type": ["null", "string"], "default": null},
+    {"name": "prompt_tokens", "type": ["null", "long"], "default": null},
+    {"name": "completion_tokens", "type": ["null", "long"], "default": null},
+    {"name": "latency_ms", "type": "double"},
+    {"name": "cost_usd", "type": ["null", "double"], "default": null},
+    {"name": "status", "type": "string"},
+    {"name": "ts_epoch_ms", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "attributes", "type": {"type": "map", "values": "string"}, "default": {}}
+  ]
+}
