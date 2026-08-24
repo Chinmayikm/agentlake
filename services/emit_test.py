@@ -46,7 +46,7 @@ def make_event(session_id: str, event_type: str) -> dict:
 if __name__ == "__main__":
     sessions = [f"session-{i}" for i in range(3)]
     types = ["AGENT_STEP", "LLM_CALL", "TOOL_CALL", "RETRIEVAL"]
-    for i in range(20):
+    for _ in range(20):
         s = random.choice(sessions)
         event = make_event(s, random.choice(types))
         producer.produce(

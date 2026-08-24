@@ -1,0 +1,24 @@
+[tool.ruff]
+# Matches how the SDK is already written. Ruff's 88-char default flags 9 lines
+# in telemetry.py that are deliberately laid out for readability.
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# Pinned explicitly. Ruff 0.16 enables 413 rules by default, so without a
+# select the rule set -- and therefore what CI rejects -- drifts with every
+# ruff upgrade. This is the "CI matches local reality" contract.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    # Nested `with` blocks are the unit under test: span nesting is the SDK's
+    # core behaviour, and flattening them to `with a, b:` destroys the intent.
+    "SIM117",
+    # `1 / 0` raises on purpose in test_span_emits_even_when_body_raises.
+    "B018",
+    # subprocess.run without check=: test_import_does_not_pull_in_confluent_kafka
+    # asserts on returncode itself. Inert today (PL is not selected); kept so it
+    # survives someone enabling pylint rules later.
+    "PLW1510",
+]

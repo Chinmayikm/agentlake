@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"   # quoted: unquoted YAML would read this as a float
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Rule set is pinned in pyproject.toml, so this matches a local run
+      # exactly. Ruff enables 413 rules by default; without the explicit
+      # select, upgrading ruff would silently change what CI rejects.
+      - name: ruff
+        run: ruff check services/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # No Kafka, no Schema Registry, no service containers -- deliberately.
+      # The suite injects a list-collector emitter and blocks the Kafka path
+      # outright (tests/conftest.py). If this job ever needs a broker to pass,
+      # that is a bug in the tests, not a missing service here.
+      - name: pytest
+        run: python -m pytest -q
+
+  contract-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git show <base>:contracts/... needs real history; the default
+          # fetch-depth of 1 would make every base ref unresolvable.
+          fetch-depth: 0
+
+      # On a PR, compare against the target branch. On a push to main,
+      # origin/main IS the commit just pushed, so comparing against it would
+      # compare the schema to itself -- use the previous tip instead.
+      - name: Work out the base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # All-zeroes means a brand-new branch with no previous tip.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="origin/main"
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing against $base"
+
+      - name: Did contracts/ change?
+        id: detect
+        run: |
+          base="${{ steps.base.outputs.ref }}"
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "Base $base does not resolve; running the check to be safe."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base"...HEAD -- contracts/ | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only "$base"...HEAD -- contracts/
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes under contracts/ -- skipping the compatibility gate."
+          fi
+
+      - name: Start Kafka and Schema Registry
+        if: steps.detect.outputs.changed == 'true'
+        run: docker compose up -d kafka schema-registry
+
+      - name: Wait for Schema Registry
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8081/subjects >/dev/null; then
+              echo "Schema Registry ready after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Schema Registry did not come up within 90s" >&2
+          docker compose logs schema-registry >&2
+          exit 1
+
+      - name: Check BACKWARD compatibility
+        if: steps.detect.outputs.changed == 'true'
+        run: python3 scripts/check_schema_compat.py --base "${{ steps.base.outputs.ref }}"
+
+      - name: Registry logs on failure
+        if: failure() && steps.detect.outputs.changed == 'true'
+        run: docker compose logs schema-registry
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

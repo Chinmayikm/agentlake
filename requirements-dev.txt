@@ -1,0 +1,10 @@
+# Development dependencies. Layered on the runtime set:
+#   .venv/bin/pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.4
+
+# Used to validate .github/workflows/*.yml locally before pushing.
+PyYAML==6.0.3
