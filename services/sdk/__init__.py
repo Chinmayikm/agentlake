@@ -22,10 +22,10 @@ from services.sdk.telemetry import (
 )
 
 __all__ = [
+    "TOPIC",
     "EmitFn",
     "EventType",
     "Span",
-    "TOPIC",
     "TraceEvent",
     "configure",
     "configure_kafka",

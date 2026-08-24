@@ -55,20 +55,21 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterator, Literal, Mapping, TypedDict, get_args
+from typing import TYPE_CHECKING, Literal, TypedDict, get_args
 
 if TYPE_CHECKING:  # imported lazily at runtime -- see _get_kafka()
     from confluent_kafka import Producer
     from confluent_kafka.schema_registry.avro import AvroSerializer
 
 __all__ = [
+    "TOPIC",
     "EmitFn",
     "EventType",
     "Span",
-    "TOPIC",
     "TraceEvent",
     "configure",
     "configure_kafka",
