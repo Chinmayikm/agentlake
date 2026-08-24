@@ -1,0 +1,5 @@
+# Runtime dependencies. Direct deps only; transitives resolve from these.
+# confluent-kafka's [avro] extra pulls in the Schema Registry client and its
+# Avro serializers, which services/sdk/telemetry.py imports lazily.
+confluent-kafka[avro]==2.15.0
+fastavro==1.12.2
