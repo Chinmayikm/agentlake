@@ -3,3 +3,12 @@
 # Avro serializers, which services/sdk/telemetry.py imports lazily.
 confluent-kafka[avro]==2.15.0
 fastavro==1.12.2
+
+# services/gateway: FastAPI service fronting the Anthropic Messages API.
+anthropic==1.0.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-dotenv==1.2.3
+# Parses services/gateway/models.yaml; runtime, not just CI, so it lives here
+# rather than in requirements-dev.txt.
+PyYAML==6.0.3

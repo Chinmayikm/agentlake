@@ -13,7 +13,22 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Nothing sets log.dirs by default -- the entrypoint generates
+      # /opt/kafka/config/server.properties purely from KAFKA_* env vars, so
+      # without this Kafka falls back to its own internal default
+      # (/tmp/kafka-logs, verified by finding live log segments there),
+      # which lives in the container's writable layer and has no
+      # permission-safe volume mount available. /var/lib/kafka/data is the
+      # path this image actually intends for persistent storage: it's
+      # pre-created and chowned to appuser inside the image itself (verified
+      # via `docker run ... ls -la /var/lib/kafka/data`), unlike
+      # /tmp/kafka-logs, which doesn't pre-exist in the image at all --
+      # mounting a fresh named volume there gets it created root-owned by
+      # Docker, which the non-root appuser process can't write into.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     mem_limit: 1g
+    volumes:
+      - kafka_data:/var/lib/kafka/data
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.1
@@ -25,3 +40,6 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:19092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
     mem_limit: 512m
+
+volumes:
+  kafka_data:

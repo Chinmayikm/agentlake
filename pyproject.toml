@@ -10,6 +10,13 @@ target-version = "py314"
 # ruff upgrade. This is the "CI matches local reality" contract.
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom is Depends(...)/Header(...)/Query(...)
+# etc. as an argument default -- B008 doesn't know that and flags every route
+# signature in services/gateway. This is the standard fix, not a suppression:
+# it tells B008 these specific calls are safe in a default position.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query", "fastapi.Path", "fastapi.Body"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = [
     # Nested `with` blocks are the unit under test: span nesting is the SDK's

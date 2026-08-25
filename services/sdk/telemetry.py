@@ -536,6 +536,34 @@ def flush(timeout: float = 5.0) -> int:
     return _kafka_runtime[0].flush(timeout)
 
 
+def warmup() -> bool:
+    """Force the Kafka producer/serializer to build now, instead of on the first span.
+
+    Resolves ADR-000's open item: lazy init costs ~800ms, and without this the
+    bill lands on whichever span happens to be first -- misleading root latency
+    for the first trace of any process. Call this from a server's startup hook.
+
+    Never raises, consistent with the rest of this module's swallow-and-log
+    emit contract (ADR-000 #2). Returns True if the producer is ready, False if
+    it could not be built (registry unreachable, bad schema path, ...); the
+    caller should still start and simply pay the lazy-init cost on the first
+    real span in that case.
+
+    Only calls configure_kafka() if no emitter is installed yet. That call has
+    the side effect of setting _EMITTER, which would otherwise silently
+    overwrite a deliberately-configured custom emitter (e.g. a test's
+    configure(events.append)) with the Kafka one.
+    """
+    if _EMITTER is None:
+        configure_kafka()
+    try:
+        _get_kafka()
+        return True
+    except Exception:
+        logger.warning("warmup failed; first span will pay the lazy-init cost", exc_info=True)
+        return False
+
+
 def _flush_at_exit() -> None:
     pending = flush()
     if pending:
