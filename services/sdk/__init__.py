@@ -19,6 +19,7 @@ from services.sdk.telemetry import (
     flush,
     session,
     span,
+    warmup,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "flush",
     "session",
     "span",
+    "warmup",
 ]

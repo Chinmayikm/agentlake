@@ -1,0 +1,22 @@
+# Model aliases and per-MTok pricing. cost_usd is computed from this table
+# only -- never hardcoded in code (see services/gateway/pricing.py). version
+# is stamped into every LLM_CALL span's attributes, so a cost figure can
+# always be traced to the price table that produced it.
+#
+# Source: https://docs.claude.com/en/docs/about-claude/pricing (verified 2026-08-25)
+version: "2026-08-intro"
+
+aliases:
+  fast:
+    provider_model_id: claude-haiku-4-5
+    input_price_per_mtok: 1.00
+    output_price_per_mtok: 5.00
+
+  quality:
+    provider_model_id: claude-sonnet-5
+    # Intro pricing, expires 2026-08-31 -> update to 3.00/15.00 and bump
+    # version (e.g. "2026-09-standard") on or after that date. There is no
+    # automatic expiry -- cost_usd will silently understate spend after
+    # 2026-08-31 until this is edited by hand.
+    input_price_per_mtok: 2.00
+    output_price_per_mtok: 10.00
