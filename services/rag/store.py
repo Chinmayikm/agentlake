@@ -43,6 +43,25 @@ class Store(Protocol):
         self, doc_id: str, chunks: list[Chunk], embeddings: np.ndarray, embedding_model: str
     ) -> None: ...
 
+    def existing_chunk_ids(self, doc_id: str) -> set[str]:
+        """chunk_ids already stored for doc_id -- the resume check: a caller
+        re-embeds only chunks NOT in this set, so a run interrupted mid-doc
+        picks back up instead of redoing already-embedded work."""
+        ...
+
+    def upsert_chunks(
+        self, doc_id: str, chunks: list[Chunk], embeddings: np.ndarray, embedding_model: str
+    ) -> None:
+        """Additive: insert/update chunks without deleting the rest of
+        doc_id's chunks first. Pairs with existing_chunk_ids() for resumable,
+        batch-at-a-time ingestion; replace_chunks() is still what makes a
+        changed doc's stale chunks disappear (see delete_chunks)."""
+        ...
+
+    def delete_chunks(self, chunk_ids: set[str]) -> None: ...
+
+    def count_chunks(self) -> int: ...
+
     def get_chunk(self, chunk_id: str) -> Chunk: ...
 
     def search(
@@ -131,12 +150,31 @@ class CorpusStore:
         embedding_model: str,
     ) -> None:
         self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+        self._conn.commit()
+        self.upsert_chunks(doc_id, chunks, embeddings, embedding_model)
+
+    def existing_chunk_ids(self, doc_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT chunk_id FROM chunks WHERE doc_id = ?", (doc_id,)
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def upsert_chunks(
+        self,
+        doc_id: str,
+        chunks: list[Chunk],
+        embeddings: np.ndarray,
+        embedding_model: str,
+    ) -> None:
         self._conn.executemany(
             """
             INSERT INTO chunks (
                 chunk_id, doc_id, project, version, section, source_path,
                 chunk_index, text, embedding, embedding_dim, embedding_model
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                text = excluded.text, embedding = excluded.embedding,
+                embedding_dim = excluded.embedding_dim, embedding_model = excluded.embedding_model
             """,
             [
                 (
@@ -156,6 +194,17 @@ class CorpusStore:
             ],
         )
         self._conn.commit()
+
+    def delete_chunks(self, chunk_ids: set[str]) -> None:
+        if not chunk_ids:
+            return
+        self._conn.executemany(
+            "DELETE FROM chunks WHERE chunk_id = ?", [(cid,) for cid in chunk_ids]
+        )
+        self._conn.commit()
+
+    def count_chunks(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 
     def get_chunk(self, chunk_id: str) -> Chunk:
         row = self._conn.execute(

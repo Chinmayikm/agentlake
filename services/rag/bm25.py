@@ -51,6 +51,9 @@ class BM25Index:
     _bm25: BM25Okapi | None = field(default=None, init=False, repr=False)
     _chunk_ids: list[str] = field(default_factory=list, init=False, repr=False)
 
+    def __len__(self) -> int:
+        return len(self._entries)
+
     def replace_chunks(self, doc_id: str, chunks: list[Chunk]) -> None:
         for old_chunk_id in self._doc_to_chunk_ids.pop(doc_id, ()):
             self._entries.pop(old_chunk_id, None)

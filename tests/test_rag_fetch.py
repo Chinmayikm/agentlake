@@ -52,11 +52,22 @@ def test_fetch_all_raises_on_unknown_strategy(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 def test_fetch_rendered_html_live(tmp_path: Path) -> None:
-    """Hits the real Kafka docs URL. Skipped by default; run with `pytest -m slow`."""
+    """Hits a real rendered-HTML doc page. Skipped by default; run with
+    `pytest -m slow`.
+
+    No currently pinned project uses the rendered_html strategy (all three
+    in sources.yaml use git_sparse_checkout -- see ADR-002 #5), so this spec
+    is synthetic rather than pulled from load_sources(); it exercises
+    fetch_rendered_html as a general capability, not the real pinned corpus.
+    """
     from services.rag.fetch import fetch_rendered_html
 
-    specs = load_sources()
-    kafka_spec = next(s for s in specs if s.name == "kafka")
-    fetched = fetch_rendered_html(kafka_spec, tmp_path)
+    spec = ProjectSpec(
+        name="kafka",
+        version="3.8",
+        strategy="rendered_html",
+        config={"urls": ["https://kafka.apache.org/38/documentation.html"]},
+    )
+    fetched = fetch_rendered_html(spec, tmp_path)
     assert fetched
     assert all(f.local_path.exists() for f in fetched)

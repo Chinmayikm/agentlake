@@ -137,6 +137,40 @@ class QdrantStore:
                 )
             ),
         )
+        self.upsert_chunks(doc_id, chunks, embeddings, embedding_model)
+
+    def existing_chunk_ids(self, doc_id: str) -> set[str]:
+        from qdrant_client.http import models as qm
+
+        client = self._get_client()
+        doc_filter = qm.Filter(
+            must=[
+                qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)),
+                qm.FieldCondition(key="kind", match=qm.MatchValue(value=_KIND_CHUNK)),
+            ]
+        )
+        ids: set[str] = set()
+        offset = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=self.collection,
+                scroll_filter=doc_filter,
+                with_payload=["chunk_id"],
+                with_vectors=False,
+                limit=1000,
+                offset=offset,
+            )
+            ids.update(p.payload["chunk_id"] for p in points)
+            if offset is None:
+                break
+        return ids
+
+    def upsert_chunks(
+        self, doc_id: str, chunks: list[Chunk], embeddings: np.ndarray, embedding_model: str
+    ) -> None:
+        from qdrant_client.http import models as qm
+
+        client = self._get_client()
         points = [
             qm.PointStruct(
                 id=_point_id(chunk.chunk_id),
@@ -159,6 +193,27 @@ class QdrantStore:
         ]
         if points:
             client.upsert(collection_name=self.collection, points=points)
+
+    def delete_chunks(self, chunk_ids: set[str]) -> None:
+        from qdrant_client.http import models as qm
+
+        if not chunk_ids:
+            return
+        client = self._get_client()
+        client.delete(
+            collection_name=self.collection,
+            points_selector=qm.PointIdsList(points=[_point_id(cid) for cid in chunk_ids]),
+        )
+
+    def count_chunks(self) -> int:
+        from qdrant_client.http import models as qm
+
+        client = self._get_client()
+        kind_filter = qm.Filter(
+            must=[qm.FieldCondition(key="kind", match=qm.MatchValue(value=_KIND_CHUNK))]
+        )
+        result = client.count(collection_name=self.collection, count_filter=kind_filter)
+        return result.count
 
     def get_chunk(self, chunk_id: str) -> Chunk:
         client = self._get_client()

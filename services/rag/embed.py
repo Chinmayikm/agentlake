@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DEFAULT_MODEL_DIM = 384
 DEFAULT_MODEL_CACHE = Path(__file__).parent / "data" / "models"
+# Caps peak RAM during one embed() call rather than materializing the whole
+# input list's activations at once -- the WSL 4GB cap is the binding
+# constraint here, not throughput.
+DEFAULT_BATCH_SIZE = 8
 
 
 class Embedder(Protocol):
@@ -41,6 +45,7 @@ class FastEmbedEmbedder:
     model_name: str = DEFAULT_MODEL_NAME
     cache_dir: Path = DEFAULT_MODEL_CACHE
     dim: int = DEFAULT_MODEL_DIM
+    batch_size: int = DEFAULT_BATCH_SIZE
     _model: object | None = field(default=None, init=False, repr=False)
 
     def embed(self, texts: Sequence[str]) -> np.ndarray:
@@ -49,7 +54,8 @@ class FastEmbedEmbedder:
 
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self._model = TextEmbedding(model_name=self.model_name, cache_dir=str(self.cache_dir))
-        return np.array(list(self._model.embed(list(texts))), dtype=np.float32)
+        vectors = self._model.embed(list(texts), batch_size=self.batch_size)
+        return np.array(list(vectors), dtype=np.float32)
 
 
 def embed_chunks(chunks: Sequence[Chunk], embedder: Embedder) -> np.ndarray:

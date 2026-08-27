@@ -171,21 +171,37 @@ present and correct, `hits` matching the returned list length.
 project's pinned version and a `strategy` key, plus a top-level `version`
 stamp used as `corpus_version` (see #1's Qdrant payload and the guard
 below). `services/rag/fetch.py` implements one `FetchStrategy` per
-publishing mechanism: `fetch_rendered_html` (Kafka's rendered doc pages) and
-`fetch_git_sparse_checkout` (Flink/Iceberg's markdown docs, versioned by tag
-in their own repos).
+publishing mechanism: `fetch_git_sparse_checkout` (a pinned commit SHA plus
+one or more `sparse_path` entries -- individual files for a flat doc tree,
+whole directories where a project genuinely splits into concepts/deployment/
+ops) and `fetch_rendered_html` (for a future doc source that only publishes
+rendered pages with no git-accessible source; not used by any currently
+pinned project).
 
-**Why.** Kafka, Flink, and Iceberg genuinely publish docs through different
-mechanisms -- this isn't one scraper with variations, it's two distinct
-retrieval strategies keyed by config. Adding a fourth doc source later is a
-YAML entry plus, at most, one new strategy function.
+**Why.** All three currently pinned projects (Kafka, Flink, Iceberg) publish
+their docs in git, so all three use `fetch_git_sparse_checkout` -- the real
+per-project difference is file-level vs. directory-level `sparse_path`
+patterns, not the fetch mechanism. Kafka's and Iceberg's doc trees are flat
+(no concepts/config/ops subdirectories), so individual files are pinned
+rather than whole directories; Flink's `docs/content/docs/` genuinely splits
+into `concepts/`, `deployment/`, and `ops/`, so those three directories are
+pinned whole. `fetch_rendered_html` stays in the protocol for the day a doc
+source shows up with no git repo to sparse-checkout from. Adding a fourth
+doc source later is a YAML entry plus, at most, one new strategy function.
 
-**Open item, deliberately deferred.** The exact pinned URLs/git tags in
-`sources.yaml` are placeholders (Kafka 3.8's rendered-doc page set, Flink's
-`release-1.20` tag, Iceberg's `apache-iceberg-1.7.0` tag) -- verify and
-correct these before running `ingest` for real. `test_fetch_rendered_html_live`
-(`tests/test_rag_fetch.py`, `@pytest.mark.slow`) exercises the real network
-path once they're confirmed.
+**Resolved: pins are final commit SHAs, not placeholders.** `sources.yaml`
+pins each project by exact commit SHA -- Kafka `771b9576...` (tag `3.8.0`),
+Flink `ea37edb7...` (branch `release-1.20`), Iceberg `5f7c992c...` (tag
+`apache-iceberg-1.7.0`) -- verified against the real repo trees before this
+PR and confirmed by the full corpus ingest (see "Ingest run notes" below:
+94 docs, 1,413 chunks). `test_fetch_rendered_html_live`
+(`tests/test_rag_fetch.py`, `@pytest.mark.slow`) now builds its own
+synthetic `ProjectSpec` rather than pulling Kafka's from `load_sources()`
+-- Kafka's real spec stopped having a `urls` key once it moved to
+`git_sparse_checkout`, which had left this slow-marked (so not caught by
+the default `pytest -q` run) test silently broken until this pass. It
+exercises `fetch_rendered_html` as a general capability now, not the real
+pinned corpus, since no currently pinned project uses that strategy.
 
 ---
 
@@ -228,6 +244,46 @@ different `corpus_version` -- the embedding model changed, `sources.yaml`'s
 version was bumped, a re-ingest hasn't run yet -- never matches the filter,
 so a version mismatch surfaces as fewer-or-zero results rather than
 silently blending stale or dimension-mismatched vectors into a ranking.
+
+---
+
+## Ingest run notes (first real corpus load, 2026-08-27)
+
+**Thrashing incident + mitigation.** The first real ingest against the full
+Kafka/Flink/Iceberg corpus thrashed the 8GB laptop (WSL capped at 4GB) --
+high iowait, stalled partway through. Root cause: embedding is
+memory-dominant at this machine's scale, not CPU-dominant, so a large
+`fastembed.embed()` call materializes activations for the whole batch at
+once. Mitigation, all in `services/rag`: `FastEmbedEmbedder.batch_size`
+(`embed.py`) capped at 8 to bound peak RAM per call; `kafka`/`schema-registry`
+deliberately left stopped during ingest to free memory for embedding (Qdrant
+alone is what's needed); and `_ingest()` (`cli.py`) made resume-aware via
+`Store.existing_chunk_ids()`/`upsert_chunks()` -- a doc's `content_hash` is
+only written after every one of its chunks is confirmed present, so a killed
+run re-detects that doc as incomplete and embeds only what's still missing,
+instead of redoing the whole document.
+
+**Qdrant WAL finding.** An unclean hard reboot mid-ingest dropped
+`points_count` from 108 to 66. Confirmed this is *not* a bad volume mount
+(the same failure class as the Kafka `log.dirs` incident): `docker inspect`
+shows the compose mount lands exactly on `/qdrant/storage`, the path Qdrant
+actually writes to, and a full `docker compose down`/`up` cycle (container
+removed and recreated, not just restarted) round-tripped 1571 points
+unchanged. The real cause is `wal_config`/`optimizer_config.flush_interval_sec:
+5` -- writes are batched and flushed to disk every 5s, not fsynced per
+request, so an abrupt power-cut (not a graceful `docker stop`, which lets
+Qdrant flush on SIGTERM) can legitimately lose whatever was in the last
+unflushed window. Data loss on unclean shutdown, not a misconfigured path.
+
+**Retrieval behavior, empirically.** Querying the real corpus for the exact
+config key `taskmanager.memory.process.size`: dense's top-3 missed
+`deployment/memory/mem_migration.md` (an old->new config key mapping table)
+entirely, surfacing only semantically-related-but-generic memory docs
+instead; BM25 ranked `mem_migration.md` #1 on the literal match, and hybrid
+promoted it to #2 -- concrete support for #3's "why hybrid" argument. The
+reverse case also showed up: for "iceberg schema evolution", BM25's #3 was
+an off-topic Flink checkpointing doc that merely shares vocabulary, which
+hybrid's RRF fusion against dense's ranking corrected back out.
 
 ---
 

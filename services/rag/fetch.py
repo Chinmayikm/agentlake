@@ -99,32 +99,61 @@ def _run_git(args: list[str], cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
+def _sparse_pattern(path: str) -> str:
+    """Non-cone sparse-checkout uses gitignore-style patterns: anchor at repo
+    root (leading /) and, for a directory (no file suffix), a trailing / so
+    it recurses -- otherwise it matches only an entry literally named `path`.
+    """
+    pattern = path if path.startswith("/") else f"/{path}"
+    if not Path(path).suffix and not pattern.endswith("/"):
+        pattern += "/"
+    return pattern
+
+
 def fetch_git_sparse_checkout(spec: ProjectSpec, dest: Path) -> list[FetchedFile]:
+    """`ref` may be a branch, tag, OR a full commit SHA -- `git clone --branch`
+    only accepts the first two, so this uses init+fetch instead, which GitHub
+    (and most modern git hosts) will resolve any of the three against.
+
+    `sparse_path` may be a single path or a list -- some projects split docs
+    into multiple sibling directories (concepts/deployment/ops), others need
+    individual files pulled out of an otherwise-irrelevant flat directory
+    (Kafka's docs/design.html, docs/configuration.html, docs/ops.html, not
+    its entire docs/). Cone mode (git's default) silently promotes a file
+    pattern to its whole containing directory -- --no-cone is what actually
+    respects file-level patterns.
+    """
     repo = spec.config["repo"]
     ref = spec.config["ref"]
-    sparse_path = spec.config["sparse_path"]
+    sparse_paths = spec.config["sparse_path"]
+    if isinstance(sparse_paths, str):
+        sparse_paths = [sparse_paths]
 
     dest.mkdir(parents=True, exist_ok=True)
     if not (dest / ".git").exists():
-        _run_git(
-            ["clone", "--depth", "1", "--branch", ref, "--filter=blob:none", "--sparse", repo, "."],
-            cwd=dest,
-        )
-        _run_git(["sparse-checkout", "set", sparse_path], cwd=dest)
-    else:
-        _run_git(["fetch", "--depth", "1", "origin", ref], cwd=dest)
-        _run_git(["checkout", "FETCH_HEAD"], cwd=dest)
+        _run_git(["init"], cwd=dest)
+        _run_git(["remote", "add", "origin", repo], cwd=dest)
+        _run_git(["sparse-checkout", "init", "--no-cone"], cwd=dest)
+        _run_git(["sparse-checkout", "set", *(_sparse_pattern(p) for p in sparse_paths)], cwd=dest)
+    _run_git(["fetch", "--depth", "1", "--filter=blob:none", "origin", ref], cwd=dest)
+    _run_git(["checkout", "FETCH_HEAD"], cwd=dest)
 
     fetched = []
-    root = dest / sparse_path
-    for local_path in sorted(root.rglob("*")):
-        if not local_path.is_file():
-            continue
-        data = local_path.read_bytes()
-        source_path = str(local_path.relative_to(dest))
-        fetched.append(
-            FetchedFile(source_path=source_path, local_path=local_path, content_hash=_sha256(data))
-        )
+    for sparse_path in sparse_paths:
+        root = dest / sparse_path
+        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+        for local_path in candidates:
+            # docs trees ship images/assets alongside content; chunk.py only reads text
+            if not local_path.is_file() or local_path.suffix not in (".md", ".html", ".htm"):
+                continue
+            data = local_path.read_bytes()
+            source_path = str(local_path.relative_to(dest))
+            content_hash = _sha256(data)
+            fetched.append(
+                FetchedFile(
+                    source_path=source_path, local_path=local_path, content_hash=content_hash
+                )
+            )
     return fetched
 
 

@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -13,31 +14,37 @@ FIXTURES = Path(__file__).parent / "fixtures" / "rag"
 
 
 class FakeFetchStrategy:
-    """Copies a fixture file into dest -- no network/git."""
+    """Copies a per-project fixture into dest -- no network/git.
 
-    def __init__(self, fixture_name: str, dest_name: str) -> None:
-        self.fixture_name = fixture_name
-        self.dest_name = dest_name
+    Dispatches on spec.name, not on which strategy key it's registered
+    under -- real sources.yaml may map several projects to the same
+    `strategy` value (e.g. all three currently use git_sparse_checkout), and
+    a fake keyed only by strategy name would then hand every project the
+    same fixture, defeating per-project assertions in these tests.
+    """
+
+    _FIXTURES: ClassVar[dict[str, tuple[str, str]]] = {
+        "kafka": ("sample_kafka.html", "doc.html"),
+        "flink": ("sample_flink.md", "doc.md"),
+        "iceberg": ("sample_iceberg.md", "doc.md"),
+    }
 
     def __call__(self, spec: ProjectSpec, dest: Path) -> list[FetchedFile]:
+        fixture_name, dest_name = self._FIXTURES[spec.name]
         dest.mkdir(parents=True, exist_ok=True)
-        local_path = dest / self.dest_name
-        shutil.copyfile(FIXTURES / self.fixture_name, local_path)
+        local_path = dest / dest_name
+        shutil.copyfile(FIXTURES / fixture_name, local_path)
         return [
             FetchedFile(
-                source_path=self.dest_name,
-                local_path=local_path,
-                content_hash=f"hash-{self.fixture_name}",
+                source_path=dest_name, local_path=local_path, content_hash=f"hash-{fixture_name}"
             )
         ]
 
 
 @pytest.fixture
 def fake_strategies() -> dict[str, object]:
-    return {
-        "rendered_html": FakeFetchStrategy("sample_kafka.html", "doc.html"),
-        "git_sparse_checkout": FakeFetchStrategy("sample_flink.md", "doc.md"),
-    }
+    strategy = FakeFetchStrategy()
+    return {"rendered_html": strategy, "git_sparse_checkout": strategy}
 
 
 @pytest.fixture
@@ -115,6 +122,7 @@ def test_ingest_single_project_filter(
         tmp_path / "bm25.pkl",
         project="kafka",
     )
+    capsys.readouterr()  # discard ingest's own progress output
 
     exit_code = main(
         ["retrieve", "log compaction", "--k", "5", "--project", "flink"],

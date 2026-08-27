@@ -72,7 +72,26 @@ def _split_markdown_sections(text: str) -> list[_Section]:
 
 
 def _split_html_sections(html: str) -> list[_Section]:
-    soup = BeautifulSoup(html, "html.parser")
+    # "lxml", not stdlib "html.parser": some doc sites (e.g. kafka.apache.org)
+    # use old-style unclosed <p> tags, valid HTML where the next block element
+    # implicitly closes the previous <p>. Python's html.parser doesn't
+    # implement that rule -- it nests every subsequent <p> INSIDE the
+    # previous one, and .get_text() then returns each ancestor's full nested
+    # text, so a chain of N paragraphs silently produces O(N^2) duplicated
+    # text (one real file measured at 108 real <p> tags exploding into a
+    # single 785,000-character "section"). lxml's parser implements standard
+    # HTML auto-closing and doesn't have this failure mode.
+    soup = BeautifulSoup(html, "lxml")
+
+    # Some doc sites ship the entire page body inside a
+    # <script type="text/x-handlebars-template"> block, client-side-rendered
+    # at view time. The parser treats <script> contents as opaque text, so
+    # without this the real markup is never parsed at all -- re-parse the
+    # template's raw text as the actual document instead.
+    template = soup.find("script", attrs={"type": "text/x-handlebars-template"})
+    if template is not None and template.string:
+        soup = BeautifulSoup(template.string, "lxml")
+
     stack: list[str] = []
     sections: list[_Section] = []
 
