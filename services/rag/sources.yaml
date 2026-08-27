@@ -1,0 +1,52 @@
+# Pinned doc sources for services/rag. Config-not-code, mirrors
+# services/gateway/models.yaml's version-stamped-table shape -- adding a new
+# project or bumping a pinned version is a YAML edit, not a code change.
+#
+# All three pinned by exact commit SHA (resolved from the tag/branch below,
+# recorded for provenance) as of 2026-08-27. Real trees were inspected before
+# picking sparse_path -- see docs/adr/ADR-002-rag-ingestion-pipeline.md #5:
+#   - kafka: docs/ is flat (design.html, configuration.html, ops.html,
+#     security.html, ... all siblings, no concepts/config/ops subdirs) --
+#     the 3 files matching that split are pinned individually, not the
+#     whole dir (which also drags in security.html/upgrade.html/connect.html
+#     /streams/, ~3x the content for no benefit here).
+#   - flink: docs/content/docs/ genuinely splits into concepts/, deployment/
+#     (config.md + memory/ tuning docs), and ops/ -- all three dirs pinned.
+#   - iceberg: docs/docs/ is also flat (38 sibling files, no subdirs) -- a
+#     representative file per bucket is pinned rather than the whole dir.
+version: "2026-08-27-pinned"
+projects:
+  kafka:
+    version: "3.8"
+    strategy: git_sparse_checkout
+    repo: https://github.com/apache/kafka.git
+    ref: 771b9576b00ecf5b64ab6e8bedf04156fbdb5cd6  # tag 3.8.0
+    sparse_path:
+      - docs/design.html          # concepts
+      - docs/configuration.html   # config
+      - docs/ops.html             # operations
+  flink:
+    version: "1.20"
+    strategy: git_sparse_checkout
+    repo: https://github.com/apache/flink.git
+    ref: ea37edb710f8069ed20f47bc9a979f14df7e44c7  # branch release-1.20
+    sparse_path:
+      - docs/content/docs/concepts
+      - docs/content/docs/deployment    # config.md + memory/ (taskmanager.memory.*)
+      - docs/content/docs/ops
+  iceberg:
+    version: "1.7"
+    strategy: git_sparse_checkout
+    repo: https://github.com/apache/iceberg.git
+    ref: 5f7c992ca673bf41df1d37543b24d646c24568a9  # tag apache-iceberg-1.7.0
+    sparse_path:
+      - docs/docs/schemas.md              # concepts
+      - docs/docs/evolution.md            # concepts (schema evolution)
+      - docs/docs/partitioning.md         # concepts
+      - docs/docs/branching.md            # concepts
+      - docs/docs/reliability.md          # concepts
+      - docs/docs/configuration.md        # config
+      - docs/docs/spark-configuration.md  # config
+      - docs/docs/flink-configuration.md  # config
+      - docs/docs/maintenance.md          # operations
+      - docs/docs/metrics-reporting.md    # operations

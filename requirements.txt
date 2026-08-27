@@ -12,3 +12,26 @@ python-dotenv==1.2.3
 # Parses services/gateway/models.yaml; runtime, not just CI, so it lives here
 # rather than in requirements-dev.txt.
 PyYAML==6.0.3
+
+# services/rag: local RAG corpus (fetch -> chunk -> embed -> store -> retrieve).
+# fastembed runs a local ONNX embedding model -- no API key, no new provider;
+# see ADR-002 #2. numpy backs the brute-force cosine search in store.py (the
+# Store protocol's sqlite test fake -- QdrantStore is the production backend).
+fastembed==0.8.0
+numpy==2.5.2
+# services/rag/fetch.py: rendered-HTML fetch strategy (Kafka docs). Already
+# resolves transitively via anthropic, declared directly per CLAUDE.md.
+httpx==0.28.1
+# services/rag/chunk.py: HTML heading/section extraction. Uses the lxml
+# parser, not stdlib html.parser -- several real doc sites (kafka.apache.org)
+# ship old-style unclosed <p> tags, and html.parser doesn't implement HTML's
+# implicit-close rule for them (nests every subsequent <p> inside the last,
+# producing quadratic-blowup duplicated text on .get_text()). lxml's parser
+# does standard HTML auto-closing and doesn't have this failure mode.
+beautifulsoup4==4.15.0
+lxml==6.1.2
+# services/rag/qdrant_store.py: production vector store client. See ADR-002 #1.
+qdrant-client==1.19.0
+# services/rag/bm25.py: sparse half of hybrid retrieval, fused with dense via
+# reciprocal rank fusion (services/rag/fusion.py). See ADR-002 #3.
+rank-bm25==0.2.2
