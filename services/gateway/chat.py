@@ -62,6 +62,10 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     stream: bool = False
+    # Anthropic-style tool definitions, passed through verbatim. Only
+    # services/agent uses this today -- see ADR-003. Never hardcoded or
+    # inspected here; the gateway stays a pure passthrough per ADR-001.
+    tools: list[dict[str, Any]] | None = None
 
 
 class UsageOut(BaseModel):
@@ -126,6 +130,8 @@ def provider_kwargs(payload: ChatRequest, model_cfg: ModelConfig) -> dict[str, A
         # sets it gets the provider's real 400 back through
         # map_provider_error(), not silent no-op behaviour. See ADR-001.
         kwargs["extra_body"] = {"temperature": payload.temperature}
+    if payload.tools:
+        kwargs["tools"] = payload.tools
     return kwargs
 
 
@@ -216,6 +222,8 @@ def sse_frame(event_name: str, data: str) -> str:
 async def chat(
     payload: ChatRequest,
     x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
+    x_trace_id: str | None = Header(default=None, alias="X-Trace-Id"),
+    x_parent_span_id: str | None = Header(default=None, alias="X-Parent-Span-Id"),
     client: anthropic.AsyncAnthropic = Depends(get_anthropic_client),
     price_table: PriceTable = Depends(get_price_table),
     stats: GatewayStats = Depends(get_stats),
@@ -235,11 +243,22 @@ async def chat(
 
     if payload.stream:
         return StreamingResponse(
-            stream_chat(payload, model_cfg, price_table, stats, client, x_session_id),
+            stream_chat(
+                payload,
+                model_cfg,
+                price_table,
+                stats,
+                client,
+                x_session_id,
+                x_trace_id,
+                x_parent_span_id,
+            ),
             media_type="text/event-stream",
         )
 
-    return await chat_once(payload, model_cfg, price_table, stats, client, x_session_id)
+    return await chat_once(
+        payload, model_cfg, price_table, stats, client, x_session_id, x_trace_id, x_parent_span_id
+    )
 
 
 async def chat_once(
@@ -249,11 +268,20 @@ async def chat_once(
     stats: GatewayStats,
     client: anthropic.AsyncAnthropic,
     x_session_id: str | None,
+    x_trace_id: str | None = None,
+    x_parent_span_id: str | None = None,
 ) -> JSONResponse | ChatResponse:
     try:
         with (
             session_ctx(x_session_id),
-            span("GATEWAY", "chat", model_alias=payload.model_alias, stream=False),
+            span(
+                "GATEWAY",
+                "chat",
+                model_alias=payload.model_alias,
+                stream=False,
+                trace_id=x_trace_id,
+                parent_span_id=x_parent_span_id,
+            ),
             span("LLM_CALL", "anthropic_messages") as llm,
         ):
             message = await client.messages.create(**provider_kwargs(payload, model_cfg))
@@ -298,10 +326,19 @@ async def stream_chat(
     stats: GatewayStats,
     client: anthropic.AsyncAnthropic,
     x_session_id: str | None,
+    x_trace_id: str | None = None,
+    x_parent_span_id: str | None = None,
 ) -> AsyncIterator[str]:
     with session_ctx(x_session_id):
         try:
-            with span("GATEWAY", "chat", model_alias=payload.model_alias, stream=True):
+            with span(
+                "GATEWAY",
+                "chat",
+                model_alias=payload.model_alias,
+                stream=True,
+                trace_id=x_trace_id,
+                parent_span_id=x_parent_span_id,
+            ):
                 with span("LLM_CALL", "anthropic_messages") as llm:
                     async with client.messages.stream(
                         **provider_kwargs(payload, model_cfg)

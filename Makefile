@@ -1,7 +1,10 @@
-.PHONY: gateway
+.PHONY: gateway traces
 
 gateway:
 	.venv/bin/uvicorn services.gateway.app:create_app --factory --reload --port 8100
+
+traces:
+	.venv/bin/python3 scripts/consume_tree.py
 
 # Non-streaming:
 #   curl -s localhost:8100/v1/chat -H 'content-type: application/json' \

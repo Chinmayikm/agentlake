@@ -19,7 +19,14 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   retrieval over pinned Kafka/Flink/Iceberg docs; QdrantStore in production, sqlite+numpy
   as the test fake; emits RETRIEVAL spans. ingest: run with kafka+sr stopped (memory), it
   is resume-aware. Details: docs/adr/ADR-002.
-- services/agent: not yet built.
+- MCP server: services/mcp_server, stdio transport, `python -m services.mcp_server`.
+  Exposes search_docs (wraps services.rag.retrieve), get_trace/query_metrics (honest
+  stubs pending ClickHouse, Day 3). Every tool call emits a TOOL_CALL span. Details:
+  docs/adr/ADR-003.
+- Agent: services/agent, `python -m services.agent "question" [--session ID] [--quality]`.
+  Bounded tool-use loop (max 8 steps) over the gateway + services/mcp_server (spawned as
+  a stdio subprocess -- a real MCP client, never a direct retrieve() import). Details:
+  docs/adr/ADR-003.
 
 ## Environment
 - WSL2 Ubuntu, 8 GB laptop, WSL capped at 4 GB -> every compose service needs mem_limit
