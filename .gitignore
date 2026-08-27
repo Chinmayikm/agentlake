@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .env
+
+# services/rag: fetched docs, the sqlite corpus, and the fastembed model
+# cache are all regenerable via `python -m services.rag ingest`.
+services/rag/data/

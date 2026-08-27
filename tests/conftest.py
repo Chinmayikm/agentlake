@@ -4,18 +4,44 @@ Every test runs with an injected list-collector emitter and no Kafka, per
 CLAUDE.md. The _no_kafka fixture makes that structural rather than aspirational.
 """
 
+import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import fastavro
+import numpy as np
 import pytest
 
 from services.sdk import TraceEvent, telemetry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = REPO_ROOT / "contracts" / "trace_event_v1.avsc"
+
+
+class FakeEmbedder:
+    """Deterministic hash-of-text projection -- no fastembed/onnxruntime, no
+    network, no model download. Same vector every time for the same text, so
+    tests can assert on nearest-neighbor ordering.
+    """
+
+    def __init__(self, dim: int = 8) -> None:
+        self.dim = dim
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        rows = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            row = np.frombuffer(digest[: self.dim], dtype=np.uint8).astype(np.float32)
+            norm = np.linalg.norm(row) or 1.0
+            rows.append(row / norm)
+        return np.stack(rows)
+
+
+@pytest.fixture
+def fake_embedder() -> FakeEmbedder:
+    return FakeEmbedder()
 
 
 @pytest.fixture

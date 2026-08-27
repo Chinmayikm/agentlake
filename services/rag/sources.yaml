@@ -1,0 +1,25 @@
+# Pinned doc sources for services/rag. Config-not-code, mirrors
+# services/gateway/models.yaml's version-stamped-table shape -- adding a new
+# project or bumping a pinned version is a YAML edit, not a code change.
+#
+# NOTE: exact URL/tag pins below are placeholders (see ADR-002 #5) -- resolve
+# them to real, verified values before running `python -m services.rag ingest`.
+version: "2026-08-pinned"
+projects:
+  kafka:
+    version: "3.8"
+    strategy: rendered_html
+    urls:
+      - https://kafka.apache.org/38/documentation.html
+  flink:
+    version: "1.20"
+    strategy: git_sparse_checkout
+    repo: https://github.com/apache/flink.git
+    ref: release-1.20
+    sparse_path: docs/content/docs
+  iceberg:
+    version: "1.7"
+    strategy: git_sparse_checkout
+    repo: https://github.com/apache/iceberg.git
+    ref: apache-iceberg-1.7.0
+    sparse_path: docs/docs/1.7.0
