@@ -521,3 +521,61 @@ def test_explicit_args_beat_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     assert telemetry._kafka_config.bootstrap_servers == "explicit:9092"
     assert telemetry._kafka_config.producer_config["enable.idempotence"] is True
     assert telemetry._kafka_config.producer_config["acks"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# 14. Explicit cross-process trace propagation
+# ---------------------------------------------------------------------------
+
+
+def test_span_joins_an_explicit_trace_and_parent(events: list[TraceEvent]) -> None:
+    """A fresh process (no contextvars) that receives trace context from
+    elsewhere (an HTTP header, an MCP tool argument) joins that trace instead
+    of rooting a new one -- the mechanism services/gateway and
+    services/mcp_server both use. See ADR-003.
+    """
+    with session("s1"):
+        with span(
+            "TOOL_CALL", "search_docs", trace_id="remote-trace", parent_span_id="remote-span"
+        ):
+            pass
+    (event,) = events
+    assert event["trace_id"] == "remote-trace"
+    assert event["parent_span_id"] == "remote-span"
+
+
+def test_span_with_explicit_trace_id_still_generates_its_own_span_id(
+    events: list[TraceEvent],
+) -> None:
+    with session("s1"):
+        with span("TOOL_CALL", "search_docs", trace_id="remote-trace", parent_span_id=None) as sp:
+            pass
+    (event,) = events
+    assert event["span_id"] != "remote-trace"
+    assert event["parent_span_id"] is None
+    assert sp.span_id == event["span_id"]
+
+
+def test_nested_span_ignores_explicit_trace_context(events: list[TraceEvent]) -> None:
+    """Explicit trace_id/parent_span_id are a fallback for a process's first
+    span only -- ordinary same-process nesting always wins, so passing them
+    from code that might run nested (or standalone) is safe.
+    """
+    with session("s1"):
+        with span("AGENT_STEP", "agent_turn") as outer:
+            with span("TOOL_CALL", "search_docs", trace_id="ignored", parent_span_id="ignored"):
+                pass
+    child, parent = events  # children emit first
+    assert parent["span_id"] == outer.span_id
+    assert child["trace_id"] == parent["trace_id"] != "ignored"
+    assert child["parent_span_id"] == parent["span_id"] != "ignored"
+
+
+def test_current_parent_span_id_reads_the_open_span(events: list[TraceEvent]) -> None:
+    assert telemetry.current_parent_span_id() is None
+    with session("s1"):
+        with span("AGENT_STEP", "agent_turn") as step:
+            assert telemetry.current_parent_span_id() == step.span_id
+            with span("TOOL_CALL", "search_docs") as tool:
+                assert telemetry.current_parent_span_id() == tool.span_id
+        assert telemetry.current_parent_span_id() is None

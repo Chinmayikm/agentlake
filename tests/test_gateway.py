@@ -229,6 +229,90 @@ def test_chat_session_id_header_propagates(app_and_client, events):
 
 
 # ---------------------------------------------------------------------------
+# 3a. X-Trace-Id / X-Parent-Span-Id headers -> GATEWAY span joins that trace
+# instead of rooting a new one (ADR-003 #4 -- cross-process trace propagation)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_joins_caller_trace_when_headers_given(app_and_client, events):
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Trace-Id": "caller-trace", "X-Parent-Span-Id": "caller-span"},
+        )
+
+    assert r.status_code == 200, r.text
+    gateway_events = [e for e in events if e["event_type"] == "GATEWAY"]
+    llm_events = [e for e in events if e["event_type"] == "LLM_CALL"]
+    assert gateway_events[0]["trace_id"] == "caller-trace"
+    assert gateway_events[0]["parent_span_id"] == "caller-span"
+    # LLM_CALL is a normal nested child -- it inherits the trace and gets
+    # GATEWAY's span_id as its parent, same as with no headers at all.
+    assert llm_events[0]["trace_id"] == "caller-trace"
+    assert llm_events[0]["parent_span_id"] == gateway_events[0]["span_id"]
+
+
+def test_chat_without_trace_headers_roots_its_own_trace(app_and_client, events):
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert r.status_code == 200, r.text
+    gateway_events = [e for e in events if e["event_type"] == "GATEWAY"]
+    assert gateway_events[0]["parent_span_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# 3b. tools passthrough -- services/agent's Anthropic-style tool use (ADR-003)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_forwards_tools_to_provider(app_and_client, events):
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+    tools = [{"name": "search_docs", "description": "search", "input_schema": {"type": "object"}}]
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={
+                "model_alias": "fast",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    assert fake.calls[0]["tools"] == tools
+
+
+def test_chat_omits_tools_when_not_given(app_and_client, events):
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert "tools" not in fake.calls[0]
+
+
+# ---------------------------------------------------------------------------
 # 4. Provider error -> HTTP error code, span status="error", gateway stays up
 # ---------------------------------------------------------------------------
 

@@ -73,6 +73,7 @@ __all__ = [
     "TraceEvent",
     "configure",
     "configure_kafka",
+    "current_parent_span_id",
     "current_session_id",
     "current_trace_id",
     "flush",
@@ -147,6 +148,16 @@ def current_session_id() -> str | None:
 def current_trace_id() -> str | None:
     """The current turn's trace_id, or None when no top-level span is open."""
     return _trace_id.get()
+
+
+def current_parent_span_id() -> str | None:
+    """The span_id a span opened right now would attach to as a child, or
+    None if none is open. Together with current_trace_id(), this is what a
+    caller reads to propagate its trace context across a process boundary
+    (HTTP header, MCP tool argument, ...) -- see span()'s trace_id/
+    parent_span_id parameters on the receiving end.
+    """
+    return _parent_span_id.get()
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +299,14 @@ def session(session_id: str | None = None) -> Iterator[str]:
 
 
 @contextmanager
-def span(event_type: EventType, name: str, **attrs: object) -> Iterator[Span]:
+def span(
+    event_type: EventType,
+    name: str,
+    *,
+    trace_id: str | None = None,
+    parent_span_id: str | None = None,
+    **attrs: object,
+) -> Iterator[Span]:
     """Open a span; emit a TraceEvent when the block exits.
 
     ``name`` is not a field in the Avro contract -- it is stored as
@@ -301,6 +319,17 @@ def span(event_type: EventType, name: str, **attrs: object) -> Iterator[Span]:
     enclosing span as parent. One trace therefore covers one top-level
     operation -- one agent turn -- and a later top-level span in the same
     session starts a new trace.
+
+    ``trace_id``/``parent_span_id``: explicit trace context carried in from
+    another process. contextvars never cross a process boundary (an HTTP
+    request, an MCP call over stdio), so a span that should join a trace
+    that originated elsewhere has no other way to learn it -- see
+    current_trace_id()/current_parent_span_id() on the sending side. They
+    are used only as a fallback for when *this process's own context* has no
+    trace open yet (i.e. this is the first span opened here for this
+    operation); ordinary same-process nesting always takes precedence, so
+    passing them is safe even from code that might sometimes run nested.
+    Leave both None for the common, single-process case.
 
     The event is emitted from a ``finally`` block, so latency is recorded and
     the event fires even when the body raises. Status precedence: the default
@@ -331,19 +360,27 @@ def span(event_type: EventType, name: str, **attrs: object) -> Iterator[Span]:
         tok_session = _session_id.set(session_id)
         logger.debug("span %r opened with no active session; implicit session %s", name, session_id)
 
-    trace_id = _trace_id.get()
-    if trace_id is None:
-        trace_id = _new_id()  # outermost span in this turn owns the trace
-        tok_trace = _trace_id.set(trace_id)
+    ctx_trace_id = _trace_id.get()
+    if ctx_trace_id is None:
+        # First span for this operation in this process: mint or adopt a
+        # trace_id, and -- only here -- an explicit parent_span_id from
+        # another process is honored too. A nested span always inherits its
+        # enclosing span's trace/parent instead, regardless of what's passed.
+        resolved_trace_id = trace_id or _new_id()
+        tok_trace = _trace_id.set(resolved_trace_id)
+        resolved_parent_span_id = parent_span_id
+    else:
+        resolved_trace_id = ctx_trace_id
+        resolved_parent_span_id = _parent_span_id.get()  # read BEFORE we overwrite it below
 
     attributes = {"name": name, **_coerce_attrs(attrs)}
     if implicit_session:
         attributes["implicit_session"] = "true"
 
     sp = Span(
-        trace_id=trace_id,
+        trace_id=resolved_trace_id,
         span_id=_new_id(),
-        parent_span_id=_parent_span_id.get(),  # read BEFORE we overwrite it below
+        parent_span_id=resolved_parent_span_id,
         session_id=session_id,
         event_type=event_type,
         ts_epoch_ms=time.time_ns() // 1_000_000,

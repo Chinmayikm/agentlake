@@ -35,3 +35,12 @@ qdrant-client==1.19.0
 # services/rag/bm25.py: sparse half of hybrid retrieval, fused with dense via
 # reciprocal rank fusion (services/rag/fusion.py). See ADR-002 #3.
 rank-bm25==0.2.2
+
+# services/mcp_server: MCP protocol implementation (stdio server) exposing
+# search_docs/get_trace/query_metrics. services/agent is an MCP *client* over
+# the same package. Pinned to the mature 1.x low-level Server/stdio API, not
+# the redesigned 2.x line -- see ADR-003.
+mcp==1.29.1
+# services/mcp_server: validates tool call arguments against each tool's JSON
+# Schema before dispatch -- runtime, not just CI. See ADR-003.
+jsonschema==4.26.0
