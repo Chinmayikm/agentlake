@@ -1,0 +1,25 @@
+<!--
+  Per query limits. These are a different axis from config.d/00-memory.xml: that
+  one caps the SERVER, this one caps a single query, so one bad GROUP BY fails
+  with a clear "memory limit exceeded" instead of taking the whole server (and
+  the Kafka consumer with it) down.
+
+  There is deliberately no separate read only "grafana_reader" user. Kafka here
+  is PLAINTEXT and Qdrant is unauthenticated, so a ClickHouse credential
+  boundary would be the only one in an otherwise open dev stack (security
+  theatre), and readonly=1 additionally requires granting max_execution_time
+  CHANGEABLE_IN_READONLY, because the Grafana plugin's driver sets it on every
+  query and otherwise fails at query time even though "Save and test" passes.
+  See ADR-005 #1.
+
+  (XML comments cannot contain a double hyphen, so no em dashes in this file.)
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <max_memory_usage>314572800</max_memory_usage>
+            <max_bytes_before_external_group_by>157286400</max_bytes_before_external_group_by>
+            <max_threads>2</max_threads>
+        </default>
+    </profiles>
+</clickhouse>

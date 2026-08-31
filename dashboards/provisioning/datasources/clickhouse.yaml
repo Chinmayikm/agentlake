@@ -1,0 +1,49 @@
+# The one datasource. Provisioned from this file rather than clicked, so a
+# fresh `make hot-up` produces working dashboards with no manual step -- and so
+# the connection details live in git next to the SQL that depends on them.
+#
+# See docs/adr/ADR-005.
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    # Pinned explicitly, and this is the single most important line in the file.
+    # Every panel in dashboards/json/*.json references the datasource by this
+    # uid. Omit it and Grafana generates a random one per install, so the
+    # dashboards provision successfully and then every panel reports
+    # "datasource not found" -- a failure that looks like a dashboard bug.
+    # tests/test_dashboards.py asserts the two stay in agreement.
+    uid: clickhouse
+    access: proxy
+    # Must match GF_AUTH_ANONYMOUS_ORG_NAME's org in docker-compose.yml
+    # ("Main Org." is org 1), or anonymous visitors land in an org this
+    # datasource does not exist in.
+    orgId: 1
+    isDefault: true
+    # The file is the source of truth; editing in the UI would silently diverge
+    # from git until the next container restart reverted it.
+    editable: false
+    jsonData:
+      host: clickhouse
+      # The native protocol, over the compose network. Not 8123: native is the
+      # plugin's default and its binary framing is cheaper than HTTP for the
+      # column-heavy results these panels return. Nothing publishes 9000 on the
+      # host (minio owns it under --profile streaming), which is fine -- Grafana
+      # is a container and resolves `clickhouse` by compose DNS. Host-side
+      # callers use 8123 instead. See ADR-005 #1.
+      port: 9000
+      protocol: native
+      secure: false
+      username: default
+      defaultDatabase: agentlake
+      dialTimeout: 10
+      # Well above the 1s NFR-5 budget every panel is measured against, so a
+      # slow query shows up as a slow panel rather than as a timeout that hides
+      # the number we actually want to see.
+      queryTimeout: 60
+    secureJsonData:
+      # No password: the `default` user is open, deliberately, in a stack whose
+      # Kafka is PLAINTEXT and whose Qdrant is unauthenticated. See ADR-005 #1
+      # and stream/clickhouse/users.d/00-profile.xml.
+      password: ''

@@ -1,0 +1,240 @@
+{
+  "id": null,
+  "uid": "agentlake-ops",
+  "title": "agentlake / ops",
+  "description": "Hot-path operational view over agentlake.trace_events_rt (ADR-005). Counts use uniqExact(span_id) so they are exact regardless of merge state; sums tolerate a transient over-count bounded by the measured duplicate window. Time-picker driven throughout.",
+  "tags": ["agentlake", "hotpath"],
+  "timezone": "",
+  "editable": true,
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Spans",
+      "description": "uniqExact(span_id), not count(): the Kafka engine is at-least-once, so a row count can transiently over-report. Distinct span ids cannot.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none", "textMode": "auto" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT uniqExact(span_id) AS spans FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Error rate",
+      "description": "status != 'ok', not status = 'error': status is a free-form contract string and the SDK promotes any set(status=...) value.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 5 }, { "color": "red", "value": 15 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "auto" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT 100.0 * uniqExactIf(span_id, status != 'ok') / greatest(uniqExact(span_id), 1) AS error_rate_pct FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cost",
+      "description": "A sum, so this is the metric that tolerates a transient over-count after a consumer rebalance. See ADR-005 #2.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none", "textMode": "auto" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT sum(cost_usd) AS cost_usd FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "p95 LLM latency",
+      "description": "The aggregate ADR-004 #6 could not produce: Flink 1.20 has no percentile function, so percentiles land here.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none", "textMode": "auto" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT quantile(0.95)(latency_ms) AS p95_ms FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND event_type = 'LLM_CALL'"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request rate by event type",
+      "description": "Spans per minute. The bucket is the panel's auto interval, so the rate is normalised by $__interval_s rather than reported per bucket.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, event_type, uniqExact(span_id) * 60.0 / $__interval_s AS spans_per_min FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) GROUP BY time, event_type ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "LLM latency p50 / p95 / p99",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, quantile(0.5)(latency_ms) AS p50, quantile(0.95)(latency_ms) AS p95, quantile(0.99)(latency_ms) AS p99 FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND event_type = 'LLM_CALL' GROUP BY time ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Error rate",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 15, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, 100.0 * uniqExactIf(span_id, status != 'ok') / greatest(uniqExact(span_id), 1) AS error_rate_pct FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) GROUP BY time ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Tokens per minute by model",
+      "description": "prompt + completion. model IS NOT NULL drops the RETRIEVAL/TOOL_CALL/AGENT_STEP rows, whose NULL model is real data rather than a defect (ADR-004 verification log).",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, model, (sum(prompt_tokens) + sum(completion_tokens)) * 60.0 / $__interval_s AS tokens_per_min FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND model IS NOT NULL GROUP BY time, model ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Cost by model",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 5, "min": 0, "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 60, "showPoints": "never", "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, model, sum(cost_usd) AS cost_usd FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND model IS NOT NULL GROUP BY time, model ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Retrieval latency p50 / p95",
+      "description": "RETRIEVAL spans from services/rag. Worth watching for the observer effect ADR-003 #6 records: an unwarmed embedding model puts the first call at ~7s against ~1s after.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, quantile(0.5)(latency_ms) AS p50, quantile(0.95)(latency_ms) AS p95 FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND event_type = 'RETRIEVAL' GROUP BY time ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Tool error rate",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 15, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 0,
+          "rawSql": "SELECT $__timeInterval_ms(ts) AS time, 100.0 * uniqExactIf(span_id, status != 'ok') / greatest(uniqExact(span_id), 1) AS tool_error_rate_pct FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND event_type = 'TOOL_CALL' GROUP BY time ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Cost per session",
+      "description": "session_id is the SDK's cross-turn key (ADR-000 #1) and the topic's partition key; trace_id is one turn. So turns here is the number of turns in the session.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "fieldConfig": { "defaults": {}, "overrides": [{ "matcher": { "id": "byName", "options": "cost_usd" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 5 }] }] },
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "cost_usd", "desc": true }] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "rawSql": "SELECT session_id, sum(cost_usd) AS cost_usd, uniqExact(trace_id) AS turns, uniqExact(span_id) AS spans FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) GROUP BY session_id ORDER BY cost_usd DESC LIMIT 20"
+        }
+      ]
+    }
+  ]
+}

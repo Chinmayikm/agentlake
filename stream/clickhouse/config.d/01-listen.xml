@@ -1,0 +1,24 @@
+<!--
+  Listen on the wildcard address, so the host and the other containers can
+  reach 8123 and 9000.
+
+  This file exists only because mounting a host directory at
+  /etc/clickhouse-server/config.d SHADOWS the image's own config.d, which ships
+  exactly one file (docker_related_config.xml) containing exactly these three
+  settings. Without them ClickHouse binds 127.0.0.1 inside the container and
+  nothing else, and the symptom is a container that reports healthy and stays
+  "Up" while every connection is refused: no error in the log, because from the
+  server's point of view nothing went wrong.
+
+  Same class of trap as the Flink jars in docker-compose.yml, which are bind
+  mounted one file at a time precisely because a directory mount over
+  /opt/flink/lib hides Flink's own jars. A directory mount is a replacement, not
+  a merge. See ADR-005 #9.
+
+  (XML comments cannot contain a double hyphen, so no em dashes in this file.)
+-->
+<clickhouse>
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+</clickhouse>

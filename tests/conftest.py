@@ -14,6 +14,7 @@ import fastavro
 import numpy as np
 import pytest
 
+from services.mcp_server import clickhouse
 from services.sdk import TraceEvent, telemetry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +70,36 @@ def _no_kafka(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("test attempted to build a Kafka producer")
 
     monkeypatch.setattr(telemetry, "_get_kafka", boom)
+
+
+@pytest.fixture(autouse=True)
+def _no_clickhouse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every un-injected ClickHouse client at a closed port.
+
+    Same job as _no_kafka, one layer over. services/mcp_server's get_trace and
+    query_metrics build a real ClickHouseClient when no `ch` is injected, so a
+    test that forgot to inject one would otherwise query whatever ClickHouse the
+    developer happens to have running -- and pass or fail on their local data.
+    That is not hypothetical: it is how the ADR-005 work first noticed this
+    fixture was missing.
+
+    Redirecting rather than raising, unlike _no_kafka, because "the store is
+    unreachable" is itself a contract these tools are required to honour
+    (ADR-003 #3) rather than an error: a forgotten injection produces the real
+    ClickHouseUnavailable path via an instant loopback refusal, and the tests
+    that assert that behaviour get to exercise the production code rather than
+    a mock of it. Nothing leaves the machine; port 1 is privileged and closed.
+
+    Set through the environment rather than by patching
+    clickhouse.default_url, and that distinction is load-bearing:
+    ClickHouseClient resolves its url with
+    ``field(default_factory=default_url)``, which captures the function object
+    when the class is defined, so rebinding the module attribute afterwards has
+    no effect. default_url() reads os.environ on every call, so setenv does.
+    (services/rag/qdrant_store.py has the same shape and the same caveat.)
+    """
+    monkeypatch.setenv("AGENTLAKE_CLICKHOUSE", "http://127.0.0.1:1")
+    assert clickhouse.default_url() == "http://127.0.0.1:1"
 
 
 @pytest.fixture(scope="session")

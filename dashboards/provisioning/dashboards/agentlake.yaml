@@ -1,0 +1,28 @@
+# Load every dashboard JSON in dashboards/json/ from disk, on an interval, with
+# the files as the source of truth.
+#
+# options.path is a path INSIDE the container, and it must agree with the bind
+# mount in docker-compose.yml. /etc/grafana/dashboards rather than the more
+# usual /var/lib/grafana/dashboards because the latter sits inside the
+# grafana_data named volume, and bind mounting a host directory at a path inside
+# a named volume is the kind of thing that works until it doesn't.
+# tests/test_dashboards.py asserts this path and the compose mount agree.
+apiVersion: 1
+
+providers:
+  - name: agentlake
+    orgId: 1
+    # Empty because the dashboards live at the top level of the folder; with
+    # foldersFromFilesStructure false, these two just mean "the General folder".
+    folder: ''
+    folderUid: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    # Edits made in the UI are not written back to the files, so allowing them
+    # would let the running dashboards drift from git with no record. Change a
+    # panel by changing the JSON.
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

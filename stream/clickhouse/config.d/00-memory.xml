@@ -1,0 +1,57 @@
+<!--
+  Sizing for a 768 MiB cgroup. Same lesson as ADR-004 #8: a container memory
+  limit does not size the process, it only kills it. ClickHouse reads cgroup
+  limits on modern versions, but the absolute cap below is stated anyway so the
+  number is visible next to the mem_limit it has to stay under, rather than
+  derived from a ratio applied to whatever RAM detection happens to return.
+
+  512 MiB of server cap against a 768 MiB limit leaves ~256 MiB of headroom for
+  the things the cap does not count: page cache, the librdkafka consumer's own
+  buffers, and the jemalloc arenas.
+
+  mark_cache_size is the trap here. Its default is 5 GiB (not an allocation, but
+  ClickHouse budgets against it), which on a small container crowds out
+  everything else. See ADR-005 #9.
+
+  Note for anyone editing this file: XML comments cannot contain a double
+  hyphen, so the em dashes used everywhere else in this repo are spelled as
+  parentheses or colons here. A stray one is a hard startup failure, not a
+  warning: "Failed to merge config with ... SAXParseException: Invalid token".
+-->
+<clickhouse>
+    <max_server_memory_usage>536870912</max_server_memory_usage>
+    <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
+
+    <mark_cache_size>134217728</mark_cache_size>
+    <index_mark_cache_size>33554432</index_mark_cache_size>
+    <!-- The whole hot table is ~50K rows and lives in the OS page cache; a
+         second decompressed copy inside ClickHouse buys nothing here. -->
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <compiled_expression_cache_size>0</compiled_expression_cache_size>
+    <mmap_cache_size>256</mmap_cache_size>
+
+    <max_concurrent_queries>8</max_concurrent_queries>
+
+    <!--
+      background_pool_size is deliberately NOT set here, and the reason is worth
+      recording because shrinking it is the standard low memory advice.
+
+      It does not shrink alone. ClickHouse sanity checks at boot that several
+      merge_tree thresholds sit below
+      background_pool_size * background_merges_mutations_concurrency_ratio, and
+      it exits 36 (BAD_ARGUMENTS) rather than starting degraded. Cutting the
+      pool to 4 tripped number_of_free_entries_in_pool_to_execute_mutation
+      (default 20, needs < 8); raising it to 8 then tripped
+      number_of_free_entries_in_pool_to_execute_optimize_entire_partition
+      (default 25, needs < 16). Each fix revealed the next.
+
+      Chasing that to the end would mean three magic numbers in this file to buy
+      a handful of lazily committed thread stacks, on a server whose actual
+      memory goes to caches and query working sets, both of which ARE capped
+      above. The pool stays at its default. Same shape as ADR-004 #8: these are
+      a system of constraints, not independent dials. See ADR-005 #9.
+
+      background_schedule_pool_size is left alone for a second reason: the Kafka
+      engine's consumer runs on it.
+    -->
+</clickhouse>

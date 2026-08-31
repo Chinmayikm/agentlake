@@ -5,6 +5,13 @@
 #   docker compose --profile rag up -d        + qdrant        (services/rag)
 #   docker compose --profile streaming up -d  + the cold path (minio, iceberg-rest,
 #                                             flink jm/tm -- see ADR-004)
+#   docker compose --profile hotpath up -d    + the hot path  (clickhouse, grafana
+#                                             -- see ADR-005)
+#
+# streaming and hotpath are meant to be run one at a time, not together: each is
+# sized to fit alongside the spine, not alongside each other. They do not fight
+# over host ports (clickhouse publishes 8123 only, precisely so minio can keep
+# 9000), so running both is a memory decision rather than an error.
 #
 # A service with no `profiles:` key starts under every invocation, which is why
 # kafka and schema-registry carry none: the Flink jobs read from one and resolve
@@ -318,8 +325,105 @@ services:
       - ./stream/flink/jobs:/sql:ro
       - ./stream/flink/verify:/verify:ro
 
+  # --- hot path (ADR-005): Kafka -> ClickHouse -> Grafana -------------------
+
+  clickhouse:
+    # The LTS line. `latest` moves weekly; a portfolio repo that cannot be
+    # reproduced six months from now is not evidence of anything.
+    image: clickhouse/clickhouse-server:26.3.27.3-alpine
+    container_name: agentlake-clickhouse
+    profiles: [hotpath]
+    # The Kafka engine table reads from one and resolves Avro schema ids
+    # against the other, exactly like the Flink jobs do.
+    depends_on: [schema-registry]
+    # HTTP only. The native protocol (9000) stays reachable inside the compose
+    # network -- which is all Grafana needs -- and is deliberately NOT published,
+    # because minio already owns host 9000 under `--profile streaming`. Every
+    # host-side caller here (stream/clickhouse/bootstrap.py,
+    # scripts/hot_path_verify.py, services/mcp_server/clickhouse.py) speaks the
+    # HTTP interface, so nothing is lost. See ADR-005 #1.
+    ports: ["8123:8123"]
+    environment:
+      # Required, and for a non-obvious reason. With neither CLICKHOUSE_USER nor
+      # CLICKHOUSE_PASSWORD set, the entrypoint tries to WRITE
+      # /etc/clickhouse-server/users.d/default-user.xml to disable network
+      # access for `default` -- into the directory mounted :ro below -- and the
+      # container exits 1 with "Read-only file system". Skipping the entrypoint's
+      # user setup is what keeps `default` reachable over the network, which is
+      # what Grafana and every HTTP caller here need. A password would be the
+      # only credential in a stack whose Kafka is PLAINTEXT and whose Qdrant is
+      # open; see ADR-005 #1 and stream/clickhouse/users.d/00-profile.xml.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    # Sizing is XML, not env vars: a mem_limit alone lets ClickHouse size its
+    # caches off host RAM and get OOM-killed rather than back-pressure -- the
+    # same trap as the Flink process.size arithmetic in ADR-004 #8 -- so the
+    # caps live in config.d/00-memory.xml.
+    #
+    # The image logs a hard warning and degrades its merge scheduling without
+    # this; the default docker ulimit (1024) is far below what a MergeTree
+    # background pool opens.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    mem_limit: 768m
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./stream/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - ./stream/clickhouse/users.d:/etc/clickhouse-server/users.d:ro
+
+  grafana:
+    # grafana/grafana-oss stopped being updated at 12.4.0 -- grafana/grafana is
+    # the maintained OSS image now.
+    image: grafana/grafana:13.2.0
+    container_name: agentlake-grafana
+    profiles: [hotpath]
+    depends_on: [clickhouse]
+    ports: ["3000:3000"]
+    environment:
+      # id and version are separated by a SPACE (comma separates plugins).
+      # Downloaded from grafana.com on every start unless /var/lib/grafana
+      # persists -- which is what the named volume below is for.
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource 4.21.1
+      # Grafana is a Go binary, so this is the knob that matters: a soft heap
+      # limit set under the cgroup makes the GC get aggressive before the OOM
+      # killer does. mem_limit is 320m rather than 256m because the peak is the
+      # plugin unzip on first start, not steady state (~120 MiB).
+      GOMEMLIMIT: 260MiB
+      # Anonymous read-only, so the dashboards are one URL with no login. The
+      # org name is matched literally against an existing org and Grafana's
+      # default is "Main Org." WITH the trailing period -- it has to agree with
+      # the orgId: 1 the provisioned datasource and dashboards use, or anonymous
+      # visitors land in an empty org and every panel reports "datasource not
+      # found". Admin login still works at /login (admin/admin).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Everything that phones home, polls, or allocates for a feature this
+      # stack does not use. Alerting is the big one: it runs a scheduler and a
+      # state store even with no rules defined.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_LOG_LEVEL: warn
+    mem_limit: 320m
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboards/provisioning:/etc/grafana/provisioning:ro
+      # Under /etc/grafana, not the more usual /var/lib/grafana/dashboards:
+      # /var/lib/grafana is the named volume above, and bind-mounting a host
+      # directory at a path inside a named volume is the kind of thing that
+      # works until it doesn't. The provider's options.path points here.
+      - ./dashboards/json:/etc/grafana/dashboards:ro
+
 volumes:
   kafka_data:
   qdrant_data:
   minio_data:
   iceberg_catalog:
+  clickhouse_data:
+  grafana_data:
