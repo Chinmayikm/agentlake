@@ -7,7 +7,9 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
 - Qdrant (vector store) at localhost:6333, backs services/rag's dense retrieval index
 - Cold path: Flink SQL -> Iceberg on MinIO, via an Iceberg REST catalog. Tables
   lake.raw.trace_events and lake.curated.agg_model_5m. See stream/flink + ADR-004.
-- Planned: ClickHouse (hot), Trino+dbt, Debezium CDC, eval harness
+- Hot path: ClickHouse Kafka engine -> agentlake.trace_events_rt (7-day TTL), with
+  Grafana provisioned on top. See stream/clickhouse + dashboards/ + ADR-005.
+- Planned: Trino+dbt, Debezium CDC, eval harness
 
 ## Compose profiles
 `docker-compose.yml` is sliced so only one heavy piece runs at a time (4 GB WSL cap):
@@ -17,6 +19,14 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   iceberg-rest, flink jobmanager/taskmanager. Measured peak: ~1.8 GB across all six
   containers, host ~2.9 of 3.9 GB. Ports: MinIO 9000 (S3) / 9001 (console),
   Iceberg REST 8181, **Flink dashboard 8082** (8081 is Schema Registry).
+- `docker compose --profile hotpath up -d` (`make hot-up`) -- + clickhouse, grafana.
+  Measured: 953 MB across all four containers, host 2.3 of 3.9 GB. Ports:
+  **ClickHouse 8123** (HTTP; native 9000 is container-internal only, so it cannot
+  collide with MinIO), **Grafana 3000** (anonymous Viewer, no login; admin/admin at
+  /login to edit).
+
+Run `streaming` OR `hotpath`, not both -- each is sized to fit beside the spine, not
+beside the other. They do not fight over host ports, so it is a memory decision.
 
 ## Services
 - Telemetry SDK: services/sdk (`from services.sdk import session, span`). contextvars
@@ -31,9 +41,13 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   as the test fake; emits RETRIEVAL spans. ingest: run with kafka+sr stopped (memory), it
   is resume-aware. Details: docs/adr/ADR-002.
 - MCP server: services/mcp_server, stdio transport, `python -m services.mcp_server`.
-  Exposes search_docs (wraps services.rag.retrieve), get_trace/query_metrics (honest
-  stubs pending ClickHouse, Day 3). Every tool call emits a TOOL_CALL span. Details:
-  docs/adr/ADR-003.
+  Exposes search_docs (wraps services.rag.retrieve), get_trace and query_metrics (both
+  real as of ADR-005, backed by ClickHouse). query_metrics takes a WHITELISTED
+  metric/window/group_by -- never free-form SQL -- and returns the SQL it ran so the
+  agent's answer can be checked; get_trace returns a nested span tree. Both return a
+  structured {"error": ...} rather than fabricate when the store is unreachable or the
+  trace is gone. Every tool call emits a TOOL_CALL span. Details: docs/adr/ADR-003 and
+  ADR-005.
 - Agent: services/agent, `python -m services.agent "question" [--session ID] [--quality]`.
   Bounded tool-use loop (max 8 steps) over the gateway + services/mcp_server (spawned as
   a stdio subprocess -- a real MCP client, never a direct retrieve() import). Details:
@@ -72,6 +86,36 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   `python -m stream.flink.create_tables --recreate && ./stream/flink/stop.sh --forget`.
   Resume needs the job SQL unchanged (Flink derives operator IDs from the plan);
   editing a query means a reset.
+
+- Hot path: stream/clickhouse. A ClickHouse Kafka engine table on traces.events.v1
+  (AvroConfluent against the registry, group `clickhouse-hotpath`) feeding two
+  materialized views: one into `agentlake.trace_events_rt` (ReplacingMergeTree, all 13
+  contract fields, 7-day TTL) and one into `agentlake.trace_events_dlq` for anything
+  that fails to parse. Grafana reads trace_events_rt; so do the MCP tools. Percentiles
+  live here -- this is what ADR-004 #6 deferred downstream. Details: docs/adr/ADR-005.
+
+  Cold start, in order:
+
+      make hot-up         # compose --profile hotpath
+      make ch-tables      # applies stream/clickhouse/sql/* in filename order
+      make traffic        # 600 spans through the real SDK
+      make ch-verify      # rows vs distinct span_ids vs topic offsets
+
+  Then http://localhost:3000 -- both dashboards are already there, provisioned from
+  dashboards/ (no clicking). `make ch-freshness` measures emit->queryable p95 (NFR-2,
+  <=5s; measured 1569 ms) and `make ch-panels` times every dashboard query by reading
+  it out of dashboards/json/ (NFR-5, <1s; measured worst 94 ms at 28K rows).
+
+  Apply order in stream/clickhouse/sql/ is load-bearing, which is what the numeric
+  prefixes encode: target tables, then the Kafka table, then the MVs -- creating an MV
+  is what starts consumption, and `CREATE MATERIALIZED VIEW ... TO` does not create its
+  target. Config for the container lives in stream/clickhouse/config.d and users.d;
+  note that mounting those directories REPLACES the image's own config.d, which is why
+  01-listen.xml has to exist (ADR-005 #9), and that XML comments cannot contain `--`.
+
+  There is no resume guard here, unlike `make flink-jobs`: offsets live in the broker,
+  so a restart resumes by itself and cannot replay into a populated table. A deliberate
+  reset is `python -m stream.clickhouse.bootstrap --recreate` (destructive).
 
 ## Environment
 - WSL2 Ubuntu, 8 GB laptop, WSL capped at 4 GB -> every compose service needs mem_limit

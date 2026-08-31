@@ -1,0 +1,22 @@
+<!--
+  librdkafka settings for every Kafka engine table. These are NOT the kafka_*
+  table settings (those live in the DDL, stream/clickhouse/sql/); this is the
+  underlying client config.
+
+  auto_offset_reset is the one that matters, and it is not the one you would
+  guess. librdkafka defaults to "largest", i.e. latest, so a brand new consumer
+  group starts at the end of the topic and silently skips everything already
+  there. The first run of `make ch-tables` against a topic with a backlog would
+  land none of it, and the verification step that compares row count against
+  produced count would report what looks exactly like data loss.
+
+  Flink's equivalent is 'scan.startup.mode' = 'earliest-offset' in
+  stream/flink/jobs/*.sql. Same intent, same reason, different layer.
+
+  (XML comments cannot contain a double hyphen, so no em dashes in this file.)
+-->
+<clickhouse>
+    <kafka>
+        <auto_offset_reset>earliest</auto_offset_reset>
+    </kafka>
+</clickhouse>

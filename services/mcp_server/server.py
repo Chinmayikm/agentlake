@@ -140,28 +140,36 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> dict:
 
 
 def warmup() -> bool:
-    """Eagerly load the embedding model and touch Qdrant, so the first real
-    search_docs call isn't billed that load cost.
+    """Eagerly load the embedding model, touch Qdrant, and touch ClickHouse, so
+    the first real tool call isn't billed those one-time costs.
 
     Recurrence of ADR-000 #3's finding: the first live RETRIEVAL span here
     measured 7.3s (fastembed's ONNX model load) against ~1s on every call
     after. Same fix, same shape -- move the one-time cost to process start.
     See ADR-003.
 
-    Never raises: a warmup failure (Qdrant unreachable, model not cached
-    yet) just means the server starts anyway and the first real search_docs
-    call pays the lazy-init cost, exactly like the pre-warmup behavior.
+    The ClickHouse ping is the third instance of the same pattern (ADR-005 #5):
+    without it the first query_metrics span would include a TCP handshake, and
+    a metric describing latency would be the one thing in this repo lying about
+    its own.
+
+    Never raises: a warmup failure (Qdrant unreachable, model not cached yet,
+    ClickHouse not running) just means the server starts anyway and the first
+    real call pays the lazy-init cost, exactly like the pre-warmup behavior.
     """
     try:
+        from services.mcp_server.clickhouse import ClickHouseClient
         from services.rag.embed import FastEmbedEmbedder
         from services.rag.qdrant_store import QdrantStore
 
         FastEmbedEmbedder().embed(["warmup"])
         QdrantStore().count_chunks()
+        with ClickHouseClient() as clickhouse:
+            clickhouse.ping()
         return True
     except Exception:
         logger.warning(
-            "mcp_server warmup failed; first search_docs call will pay the lazy-init cost",
+            "mcp_server warmup failed; the first tool call will pay the lazy-init cost",
             exc_info=True,
         )
         return False

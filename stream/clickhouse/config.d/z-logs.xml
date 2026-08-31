@@ -1,0 +1,39 @@
+<!--
+  ClickHouse ships a dozen system.*_log tables on by default. On a laptop they
+  are the single largest consumer of both disk and background merge work on a
+  server that is otherwise nearly idle: metric_log alone writes a row per second
+  per metric.
+
+  Two things about this file are load-bearing:
+
+  1. It MUST be in config.d, not config.xml. Editing the main config does not
+     remove these tables; they get created anyway. (ClickHouse#62716.)
+  2. The "z" prefix. config.d loads alphabetically, and a remove="1" only takes
+     effect if it is applied after the definition it removes.
+
+  query_log is deliberately KEPT, bounded by a 1 day TTL rather than deleted.
+  This is an observability platform; a hot store that discards the record of its
+  own queries would be a bad joke, and it is what makes "why was that dashboard
+  panel slow" answerable at all. It is also the cheapest of the set, since rows
+  are written per query rather than per second.
+
+  (XML comments cannot contain a double hyphen, so no em dashes in this file.)
+-->
+<clickhouse>
+    <query_log>
+        <ttl>event_date + INTERVAL 1 DAY DELETE</ttl>
+        <flush_interval_milliseconds>30000</flush_interval_milliseconds>
+    </query_log>
+
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <trace_log remove="1"/>
+    <part_log remove="1"/>
+    <text_log remove="1"/>
+    <session_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <error_log remove="1"/>
+    <latency_log remove="1"/>
+</clickhouse>

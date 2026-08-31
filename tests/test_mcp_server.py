@@ -83,6 +83,29 @@ def _deps(seeded_store, fake_embedder, seeded_bm25) -> dict:
     return {"store": seeded_store, "embedder": fake_embedder, "bm25_index": seeded_bm25}
 
 
+class _StubClickHouse:
+    """One root span, enough for tests here that only care about dispatch.
+    The real coverage of these tools lives in tests/test_hot_path_tools.py."""
+
+    def query(self, sql: str, params: dict[str, str] | None = None) -> list[dict]:
+        return [
+            {
+                "span_id": "s1",
+                "parent_span_id": None,
+                "session_id": "sess",
+                "event_type": "AGENT_STEP",
+                "model": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "latency_ms": 1.0,
+                "cost_usd": None,
+                "status": "ok",
+                "ts_epoch_ms": 1,
+                "attributes": {"name": "agent_turn"},
+            }
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Schema validation
 # ---------------------------------------------------------------------------
@@ -143,18 +166,46 @@ def test_search_docs_default_mode_and_k(
 
 
 # ---------------------------------------------------------------------------
-# Honest stubs
+# Honest failure -- the contract ADR-003 #3 fixed before ClickHouse existed
+#
+# get_trace and query_metrics used to be stubs that always errored. They are
+# real now (ADR-005), but the {"error": ...} shape was written as the permanent
+# answer for an unreachable store, not as a placeholder, so these tests moved
+# from "always errors" to "still errors, honestly, when there is nothing to
+# read". Their behaviour with a store attached lives in
+# tests/test_hot_path_tools.py, against an injected fake client.
 # ---------------------------------------------------------------------------
 
 
-def test_get_trace_is_an_honest_stub(events) -> None:
+def test_get_trace_reports_an_unreachable_store_rather_than_inventing_a_trace(events) -> None:
+    # No `deps`, so this builds a real ClickHouseClient and takes the real
+    # failure path; conftest's _no_clickhouse fixture is what makes that an
+    # instant loopback refusal instead of a query against a live store.
     result = dispatch_tool("get_trace", {"trace_id": "t1"})
-    assert result == {"error": "trace store not yet available (ClickHouse lands Day 3)"}
+    assert "trace store unreachable" in result["error"]
+    assert "spans" not in result
 
 
-def test_query_metrics_is_an_honest_stub(events) -> None:
-    result = dispatch_tool("query_metrics", {"metric": "latency_p50", "window": "1h"})
-    assert result == {"error": "metrics store not yet available (ClickHouse lands Day 3)"}
+def test_query_metrics_reports_an_unreachable_store_rather_than_inventing_a_number(
+    events,
+) -> None:
+    result = dispatch_tool("query_metrics", {"metric": "p95_latency", "window": "1h"})
+    assert "metrics store unreachable" in result["error"]
+    assert "rows" not in result
+
+
+def test_tool_descriptions_no_longer_claim_to_be_stubs() -> None:
+    """The descriptions are what the model reads when deciding whether a tool
+    is worth calling (services/agent/loop.py builds TOOL_DEFS from them), so a
+    stale "HONEST STUB ... Lands Day 3" would talk it out of using a tool that
+    now works."""
+    from services.mcp_server.schemas import GET_TRACE_DESCRIPTION, QUERY_METRICS_DESCRIPTION
+
+    for description in (GET_TRACE_DESCRIPTION, QUERY_METRICS_DESCRIPTION):
+        assert "STUB" not in description.upper()
+        assert "Day 3" not in description
+        # What has to stay: both still promise to error rather than fabricate.
+        assert "error" in description
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +259,16 @@ def test_dispatch_tool_joins_caller_trace_via_trace_context(events) -> None:
 
 def test_dispatch_tool_strips_trace_context_before_schema_validation(events) -> None:
     # Every tool schema sets additionalProperties: False -- an unstripped
-    # "_trace_context" key would be reported as an invalid argument.
+    # "_trace_context" key would be reported as an invalid argument. Reaching
+    # the tool at all is the assertion; the injected client keeps it from
+    # depending on what a store does or does not hold.
     result = dispatch_tool(
         "get_trace",
         {"trace_id": "t1", "_trace_context": {"trace_id": "x", "parent_span_id": "y"}},
+        {"ch": _StubClickHouse()},
     )
-    assert result == {"error": "trace store not yet available (ClickHouse lands Day 3)"}
+    assert "invalid arguments" not in result.get("error", "")
+    assert result["span_count"] == 1
 
 
 def test_dispatch_tool_args_preview_excludes_trace_context(events) -> None:
@@ -234,7 +289,7 @@ def test_dispatch_tool_without_trace_context_roots_its_own_trace(events) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_warmup_loads_embedder_and_touches_qdrant(monkeypatch) -> None:
+def test_warmup_loads_embedder_and_touches_qdrant_and_clickhouse(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "services.rag.embed.FastEmbedEmbedder.embed",
@@ -244,8 +299,15 @@ def test_warmup_loads_embedder_and_touches_qdrant(monkeypatch) -> None:
         "services.rag.qdrant_store.QdrantStore.count_chunks",
         lambda self: calls.append("count_chunks") or 0,
     )
+    # Third store, same reason (ADR-005 #5): without it the first
+    # query_metrics span would include a TCP handshake, so a metric describing
+    # latency would be the one thing here lying about its own.
+    monkeypatch.setattr(
+        "services.mcp_server.clickhouse.ClickHouseClient.ping",
+        lambda self: calls.append("ping") or True,
+    )
     assert warmup() is True
-    assert calls == ["embed", "count_chunks"]
+    assert calls == ["embed", "count_chunks", "ping"]
 
 
 def test_warmup_never_raises_on_failure(monkeypatch) -> None:
