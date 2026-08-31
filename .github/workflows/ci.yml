@@ -34,7 +34,7 @@ jobs:
       # exactly. Ruff enables 413 rules by default; without the explicit
       # select, upgrading ruff would silently change what CI rejects.
       - name: ruff
-        run: ruff check services/ tests/
+        run: ruff check services/ tests/ stream/ scripts/
 
   test:
     runs-on: ubuntu-latest
