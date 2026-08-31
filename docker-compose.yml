@@ -1,3 +1,44 @@
+# Profiles carve this file into slices that fit a 4 GB WSL box one at a time:
+#
+#   docker compose up -d                      kafka + schema-registry (the spine;
+#                                             everything else depends on it)
+#   docker compose --profile rag up -d        + qdrant        (services/rag)
+#   docker compose --profile streaming up -d  + the cold path (minio, iceberg-rest,
+#                                             flink jm/tm -- see ADR-004)
+#
+# A service with no `profiles:` key starts under every invocation, which is why
+# kafka and schema-registry carry none: the Flink jobs read from one and resolve
+# Avro schemas against the other. qdrant is profiled precisely so that bringing
+# the streaming slice up does not also start 512 MB of vector store nobody asked
+# for. Measured peak with the streaming profile up: ~2.9 GiB of 3.8 GiB.
+
+# The six jars every Flink container needs on its classpath. Bind-mounted as
+# individual files, never as a directory: a directory mount over /opt/flink/lib
+# shadows Flink's own jars and the container will not start. Fetch them first
+# with `make flink-jars` (scripts/fetch_flink_jars.sh, checksums pinned there).
+#
+# One anchor per jar rather than one anchor for the whole list, because YAML has
+# no merge operator for sequences -- `<<:` only merges mappings, and `- *list`
+# would nest a list inside `volumes:` instead of extending it. Each service that
+# needs the classpath repeats six alias lines, but the version-pinned paths --
+# the part that must not drift -- are written exactly once.
+x-flink-jars:
+  kafka: &jar-kafka
+    ./stream/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka.jar:ro
+  avro: &jar-avro
+    ./stream/flink/lib/flink-sql-avro-confluent-registry-1.20.5.jar:/opt/flink/lib/flink-sql-avro-confluent-registry.jar:ro
+  iceberg: &jar-iceberg
+    ./stream/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime.jar:ro
+  aws: &jar-aws
+    ./stream/flink/lib/iceberg-aws-bundle-1.10.1.jar:/opt/flink/lib/iceberg-aws-bundle.jar:ro
+  # Not because anything here uses Hadoop -- the catalog is REST and the storage
+  # is S3 -- but because Iceberg's FlinkCatalogFactory signature takes a
+  # org.apache.hadoop.conf.Configuration regardless. See fetch_flink_jars.sh.
+  hadoop-api: &jar-hadoop-api
+    ./stream/flink/lib/hadoop-client-api-3.4.2.jar:/opt/flink/lib/hadoop-client-api.jar:ro
+  hadoop-runtime: &jar-hadoop-runtime
+    ./stream/flink/lib/hadoop-client-runtime-3.4.2.jar:/opt/flink/lib/hadoop-client-runtime.jar:ro
+
 services:
   kafka:
     image: apache/kafka:3.8.0
@@ -46,11 +87,239 @@ services:
     # client/server minor-version drift >1 triggers a compatibility warning.
     image: qdrant/qdrant:v1.19.0
     container_name: agentlake-qdrant
+    profiles: [rag]
     ports: ["6333:6333"]
     mem_limit: 512m
     volumes:
       - qdrant_data:/qdrant/storage
 
+  # --- cold path (ADR-004): Kafka -> Flink SQL -> Iceberg on MinIO -----------
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: agentlake-minio
+    profiles: [streaming]
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentlake}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+    mem_limit: 256m
+    volumes:
+      - minio_data:/data
+
+  # One-shot: create the warehouse bucket, then exit. Everything downstream
+  # waits on service_completed_successfully rather than on a healthcheck, so
+  # "MinIO is up" and "the bucket exists" are two separate, observable facts.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: agentlake-minio-init
+    profiles: [streaming]
+    depends_on: [minio]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentlake}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set lake http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        echo 'waiting for minio...'; sleep 1;
+      done;
+      mc mb --ignore-existing lake/lake &&
+      echo 'bucket s3://lake ready';
+      "
+    mem_limit: 64m
+
+  iceberg-rest:
+    # apache/iceberg-rest-fixture is upstream's *test* fixture -- a JdbcCatalog
+    # behind the REST spec. It is the only maintained REST-catalog image
+    # (tabulario/iceberg-rest stopped at Iceberg 1.6.0), and its newest tag is
+    # what pins Iceberg to 1.10.1 everywhere else. See ADR-004 #1 and #7.
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: agentlake-iceberg-rest
+    profiles: [streaming]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports: ["8181:8181"]
+    environment:
+      # CATALOG_* env vars become catalog properties: single underscore -> dot,
+      # double underscore -> dash, lowercased (Iceberg's RCKUtils).
+      CATALOG_WAREHOUSE: s3://lake/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # The image defaults this to jdbc:sqlite:/tmp/iceberg_catalog.db, which
+      # lives in the container layer -- every `down` would drop the catalog
+      # while the data files survived in MinIO, i.e. an orphaned warehouse. The
+      # volume is mounted at /home/iceberg and not /tmp because the image runs
+      # as uid 1000 `iceberg` and only /home/iceberg pre-exists owned by that
+      # user; Docker seeds a fresh named volume from the image directory it
+      # covers, ownership included, so this is the one path here that a
+      # non-root process can write into. (Same class of trap as KAFKA_LOG_DIRS.)
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/catalog.db
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentlake}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+      # S3FileIO's AWS SDK client refuses to build without a region even though
+      # MinIO ignores it.
+      AWS_REGION: us-east-1
+      JAVA_TOOL_OPTIONS: -Xmx256m
+    mem_limit: 384m
+    volumes:
+      - iceberg_catalog:/home/iceberg
+
+  flink-jobmanager:
+    image: flink:1.20.5-scala_2.12-java11
+    container_name: agentlake-flink-jm
+    profiles: [streaming]
+    depends_on: [iceberg-rest]
+    command: jobmanager
+    ports: ["8082:8081"]   # host 8082: schema-registry already owns 8081
+    environment:
+      # Checkpoints go to MinIO, not to a local volume, which needs Flink's
+      # bundled S3 filesystem enabled as a plugin (it ships in /opt/flink/opt/
+      # and is loaded in an isolated classloader, so its shaded Hadoop cannot
+      # collide with the hadoop-client jars in lib/). The first attempt here was
+      # a named volume shared by JM and TM; it failed with "Failed to create
+      # directory for shared state" because a fresh named volume is created
+      # root-owned and this image runs as uid 9999 `flink`. Object storage is
+      # the better answer regardless: it is reachable from every container,
+      # outlives any of them, and is what a real deployment checkpoints to.
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.5.jar
+      # Iceberg's S3FileIO runs inside the Flink processes and authenticates
+      # through the AWS SDK's default provider chain, so MinIO's credentials
+      # reach it as environment variables rather than as CREATE CATALOG options
+      # -- catalog options live in stream/flink/jobs/*.sql, which is committed.
+      # AWS_REGION is required even though MinIO ignores it: without it the SDK
+      # refuses to build a client ("Unable to load region from any of the
+      # providers in the chain").
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentlake}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+      AWS_REGION: us-east-1
+      # Every *.memory.process.size below is deliberately under its mem_limit.
+      # Without it the JVM sizes itself from host RAM, overshoots the cgroup and
+      # is OOM-killed instead of back-pressuring. See ADR-004 #8.
+      #
+      # Heap is what is LEFT after metaspace, JVM overhead and off-heap are
+      # subtracted from process.size -- it is not a share of it. At the stock
+      # defaults (256m metaspace + 192m overhead floor + 128m off-heap) a 600m
+      # JobManager derives a 24 MB heap and dies of OutOfMemoryError during
+      # startup, which is exactly what happened here before these four lines
+      # existed. Shrinking the three fixed regions is what buys the 284m heap.
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 700m
+        jobmanager.memory.jvm-metaspace.size: 192m
+        jobmanager.memory.jvm-overhead.min: 128m
+        jobmanager.memory.jvm-overhead.max: 128m
+        jobmanager.memory.off-heap.size: 96m
+        rest.address: 0.0.0.0
+        rest.bind-address: 0.0.0.0
+        parallelism.default: 1
+        state.backend.type: hashmap
+        state.checkpoints.dir: s3://lake/checkpoints
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: ${MINIO_ROOT_USER:-agentlake}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+        # 60 x 10s = a 10-minute budget for the TaskManager to come back. The
+        # first version of this was 10 x 5s, i.e. 50 seconds, and it did not
+        # survive the `docker kill agentlake-flink-tm` recovery test: restarting
+        # the container on this box takes ~2.5 minutes (JVM start, plugin
+        # extraction, slot registration), so both jobs exhausted their attempts
+        # and failed permanently -- losing their state, which on resubmit means
+        # replaying from earliest into a table that already has those rows.
+        # The restart budget has to exceed how long the thing it is waiting for
+        # actually takes.
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 60
+        restart-strategy.fixed-delay.delay: 10s
+    mem_limit: 768m
+    volumes:
+      - *jar-kafka
+      - *jar-avro
+      - *jar-iceberg
+      - *jar-aws
+      - *jar-hadoop-api
+      - *jar-hadoop-runtime
+
+  flink-taskmanager:
+    image: flink:1.20.5-scala_2.12-java11
+    container_name: agentlake-flink-tm
+    profiles: [streaming]
+    depends_on: [flink-jobmanager]
+    command: taskmanager
+    environment:
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.20.5.jar
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentlake}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+      AWS_REGION: us-east-1
+      # 960m of a 1024m cgroup. Task heap is the remainder, so it is bought back
+      # from managed memory -- which only matters to the RocksDB state backend,
+      # and this runs hashmap. That heap is what the Iceberg Parquet writers
+      # need. Flink logs the resulting breakdown at TM startup; ADR-004 #8
+      # records the measured numbers.
+      #
+      # framework.off-heap.size stays at its 128m default on purpose. Cutting it
+      # to 64m looked free under the streaming jobs and then broke every *batch*
+      # query -- the verification queries in stream/flink/verify -- with "Can't
+      # allocate enough direct buffer for batch shuffle read buffer pool".
+      # Flink carves the batch shuffle pool out of framework off-heap, and its
+      # own error message says it: "If you have ever decreased
+      # taskmanager.memory.framework.off-heap.size, you need to undo the
+      # decrement." Streaming and batch do not have the same memory profile.
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 960m
+        taskmanager.memory.managed.fraction: 0.05
+        taskmanager.memory.network.min: 32m
+        taskmanager.memory.network.max: 64m
+        taskmanager.numberOfTaskSlots: 2
+        state.backend.type: hashmap
+        state.checkpoints.dir: s3://lake/checkpoints
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: ${MINIO_ROOT_USER:-agentlake}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+    mem_limit: 1024m
+    volumes:
+      - *jar-kafka
+      - *jar-avro
+      - *jar-iceberg
+      - *jar-aws
+      - *jar-hadoop-api
+      - *jar-hadoop-runtime
+
+  # Not part of the `streaming` profile: this is a one-shot client, driven by
+  # `docker compose run --rm flink-sql-client ...` (see stream/flink/submit.sh),
+  # which enables the service's own profile automatically.
+  flink-sql-client:
+    image: flink:1.20.5-scala_2.12-java11
+    profiles: [sql]
+    depends_on: [flink-jobmanager]
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentlake}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+        parallelism.default: 1
+    mem_limit: 512m
+    volumes:
+      - *jar-kafka
+      - *jar-avro
+      - *jar-iceberg
+      - *jar-aws
+      - *jar-hadoop-api
+      - *jar-hadoop-runtime
+      - ./stream/flink/jobs:/sql:ro
+      - ./stream/flink/verify:/verify:ro
+
 volumes:
   kafka_data:
   qdrant_data:
+  minio_data:
+  iceberg_catalog:

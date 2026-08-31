@@ -3,6 +3,14 @@ __pycache__/
 *.pyc
 .env
 
+# stream/flink: connector jars, ~172 MB, regenerable via `make flink-jars`
+# (scripts/fetch_flink_jars.sh pins every URL and checksum).
+stream/flink/lib/
+
+# stream/flink: where stop.sh files each job's retained-checkpoint path so
+# submit.sh --resume can find it. Machine-local state, not source.
+stream/flink/.resume/
+
 # services/rag: fetched docs, the sqlite corpus, and the fastembed model
 # cache are all regenerable via `python -m services.rag ingest`.
 services/rag/data/
