@@ -420,6 +420,43 @@ services:
       # works until it doesn't. The provider's options.path points here.
       - ./dashboards/json:/etc/grafana/dashboards:ro
 
+  # --- tools (on demand): a browser onto the topic itself ---------------------
+
+  kafka-ui:
+    # Apache-2.0, which is why this and not Redpanda Console: Console is BSL
+    # licensed, and a dev dependency of an MIT project should not be something
+    # a contributor cannot freely run. Pinned to v0.7.2, provectus's last
+    # release; the actively maintained fork is kafbat/kafka-ui if this goes
+    # stale.
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: agentlake-kafka-ui
+    profiles: [tools]
+    depends_on: [kafka, schema-registry]
+    # Container-internal 8080 -> host 8090. 8080 is left alone deliberately:
+    # it is the first port anything else on a dev box grabs.
+    ports: ["8090:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: agentlake
+      # The INTERNAL listener, like every other container on this network.
+      # localhost:9092 is the EXTERNAL one and only resolves from the host.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      # Without this, TraceEvents render as unreadable Avro bytes: the payload
+      # carries only a schema id, and the registry is what turns that id back
+      # into fields. This is the whole point of running the UI.
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      # A Spring Boot app under a 320m cgroup needs its heap stated, the same
+      # argument ADR-004 #8 makes for Flink: left alone, the JVM sizes itself
+      # off the container limit and the fixed regions leave nothing usable.
+      # 160m heap measured comfortable against a 3-topic cluster; the rest of
+      # the 320m is metaspace, code cache and thread stacks.
+      JAVA_OPTS: -Xms64m -Xmx160m -XX:MaxMetaspaceSize=96m -XX:+UseSerialGC
+      # Read-only: this is a window onto the topic, not a way to publish to it
+      # or delete from it. Nothing in agentlake should be produced by hand.
+      DYNAMIC_CONFIG_ENABLED: "false"
+      KAFKA_CLUSTERS_0_READONLY: "true"
+      LOGGING_LEVEL_ROOT: warn
+    mem_limit: 320m
+
 volumes:
   kafka_data:
   qdrant_data:

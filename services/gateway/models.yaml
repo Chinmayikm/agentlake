@@ -4,7 +4,7 @@
 # always be traced to the price table that produced it.
 #
 # Source: https://docs.claude.com/en/docs/about-claude/pricing (verified 2026-08-25)
-version: "2026-08-intro"
+version: "2026-09-standard"
 
 aliases:
   fast:
@@ -14,9 +14,9 @@ aliases:
 
   quality:
     provider_model_id: claude-sonnet-5
-    # Intro pricing, expires 2026-08-31 -> update to 3.00/15.00 and bump
-    # version (e.g. "2026-09-standard") on or after that date. There is no
-    # automatic expiry -- cost_usd will silently understate spend after
-    # 2026-08-31 until this is edited by hand.
-    input_price_per_mtok: 2.00
-    output_price_per_mtok: 10.00
+    # Standard rate. Launch pricing was 2.00/10.00 per MTok under price table
+    # version "2026-08-intro" and ran through 2026-08-31; spans emitted in that
+    # window carry that version and should be costed at the old rate. See
+    # ADR-001 #2 -- this hand edit is the expiry mechanism, by design.
+    input_price_per_mtok: 3.00
+    output_price_per_mtok: 15.00

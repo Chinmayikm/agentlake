@@ -24,9 +24,18 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   **ClickHouse 8123** (HTTP; native 9000 is container-internal only, so it cannot
   collide with MinIO), **Grafana 3000** (anonymous Viewer, no login; admin/admin at
   /login to edit).
+- `docker compose --profile tools up -d kafka-ui` -- + kafka-ui (provectuslabs
+  v0.7.2, Apache-2.0). On demand only, never part of a normal bring-up. Port
+  **kafka-ui 8090** (container 8080 is remapped; 8080 stays free for anything else).
+  Reads the topic through the registry, so TraceEvents render as decoded Avro fields
+  rather than bytes. Read-only and no dynamic config -- it is a window onto the topic,
+  not a way to produce to it. Measured 201 MB of a 320 MB limit, healthy ~30s after
+  start; the JVM heap is pinned in JAVA_OPTS because a Spring Boot app left to size
+  itself off a 320 MB cgroup has no usable heap (same argument as ADR-004 #8).
 
 Run `streaming` OR `hotpath`, not both -- each is sized to fit beside the spine, not
 beside the other. They do not fight over host ports, so it is a memory decision.
+`tools` is small enough to sit beside either, but it is still opt-in.
 
 ## Services
 - Telemetry SDK: services/sdk (`from services.sdk import session, span`). contextvars
