@@ -8,11 +8,15 @@ Agents fail quietly. A retrieval step returns the wrong chunk, a prompt change d
 token spend, answer quality drifts over a week — and nothing crashes, no alert fires, no
 error rate moves. By the time anyone notices, the traces that would explain it are gone.
 
-The tools that watch agents today are closed SaaS: your telemetry lands in someone
-else's schema, behind someone else's query language, priced per event. agentlake takes
-the opposite position — one contract, and two paths off it: a hot path that answers
-"what is happening right now" in about a second, and a cold path that keeps every event
-exactly once, forever.
+Most observability treats telemetry as something an application collects and shows you
+back through its own interface; the storage underneath is an implementation detail you
+are not meant to query directly. agentlake takes a different position: the telemetry
+*is* the product. One versioned Avro contract, enforced by a schema registry, on a Kafka
+topic any consumer can subscribe to; landing in Iceberg tables any engine can query and
+ClickHouse tables you own the DDL for. There is no application between you and your
+data — dashboards, warehouse marts, evals, and the agent's own tools all read the same
+contract. Two paths off it: a hot path that answers "what is happening right now" in
+about a second, and a cold path that keeps every event exactly once, forever.
 
 ## Why agentlake
 
@@ -94,8 +98,8 @@ prompt, or tool your money is actually going to.
 - **Data and platform engineers** who want a reference implementation of a streaming
   lakehouse for AI telemetry — every design decision is an ADR, and every number links to
   the script that produced it.
-- **Anyone evaluating the build-vs-buy line** for LLM observability: this is what the
-  build side actually involves, documented end to end.
+- **Anyone evaluating the build-vs-buy line** for LLM observability: this is what owning
+  the data layer actually involves, documented end to end.
 
 ## Components
 
