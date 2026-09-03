@@ -1,0 +1,58 @@
+version: 2
+
+# The two Iceberg tables the Flink jobs write (ADR-004). Column lists here are
+# not decoration: tests/test_analytics_project.py compares them against
+# stream/flink/create_tables.py's RAW_SCHEMA and AGG_SCHEMA, which are in turn
+# checked against contracts/trace_event_v1.avsc by
+# tests/test_cold_path_contract.py. So a contract change that is not carried
+# through to the analytics layer fails in CI rather than showing up as a column
+# that quietly stopped being selected.
+sources:
+  - name: lake_raw
+    database: lake
+    schema: raw
+    description: >
+      Every TraceEvent, append-only, hidden-partitioned by day(ts_epoch_ms).
+      Written exclusively by stream/flink/jobs/01_raw_sink.sql.
+    tables:
+      - name: trace_events
+        description: One row per span. No TTL -- this is the archive.
+        columns:
+          - name: trace_id
+          - name: span_id
+          - name: parent_span_id
+          - name: session_id
+          - name: event_type
+          - name: model
+          - name: prompt_tokens
+          - name: completion_tokens
+          - name: latency_ms
+          - name: cost_usd
+          - name: status
+          - name: ts_epoch_ms
+          - name: attributes
+
+  - name: lake_curated
+    database: lake
+    schema: curated
+    description: >
+      Event-time 5-minute tumbling aggregates. Written exclusively by
+      stream/flink/jobs/02_agg_model_5m.sql.
+    tables:
+      - name: agg_model_5m
+        description: >
+          Aggregates by (event_type, model) per closed 5-minute window. Carries
+          no percentile -- Flink 1.20 has no percentile aggregate (ADR-004 #6),
+          which is the gap fct_model_costs closes from raw.
+        columns:
+          - name: window_start
+          - name: window_end
+          - name: event_type
+          - name: model
+          - name: event_count
+          - name: error_count
+          - name: prompt_tokens_sum
+          - name: completion_tokens_sum
+          - name: cost_usd_sum
+          - name: latency_sum_ms
+          - name: latency_max_ms

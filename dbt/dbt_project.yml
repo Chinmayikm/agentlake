@@ -1,0 +1,42 @@
+name: agentlake
+version: "1.0.0"
+config-version: 2
+profile: agentlake
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Everything is a table, and that is not a preference -- Trino's Iceberg
+# connector cannot CREATE VIEW against a REST catalog, and the JDBC catalog
+# behind apache/iceberg-rest-fixture does not support views at all. Staging
+# models are therefore real Iceberg tables rather than the views dbt convention
+# would make them. See ADR-006 #3.
+#
+# on_table_exists: drop -- and the two rejected values are worth recording,
+# because both look better and neither works here.
+#
+# `replace` (CREATE OR REPLACE TABLE) is the tidiest: one atomic catalog write,
+# no window where the table is missing. It fails DETERMINISTICALLY against this
+# warehouse with "ICEBERG_COMMIT_ERROR ... 500: Unknown failure" -- a
+# replace-table commit is an UPDATE against the existing catalog row, and the
+# Iceberg REST fixture's JdbcCatalog does not carry it out. It appeared to work
+# exactly once, on tables that did not yet exist, i.e. when REPLACE degenerates
+# to CREATE.
+#
+# `rename` is dbt-trino's default (build under a temp name, drop the old,
+# rename) and costs three catalog writes per model instead of two.
+#
+# `drop` is what is left, and it is sufficient once the catalog stops racing
+# itself -- see CATALOG_CLIENTS in docker-compose.yml. See ADR-006 #8.
+models:
+  agentlake:
+    +materialized: table
+    +on_table_exists: drop
+
+# dbt writes into lake.analytics and nowhere else. lake.raw and lake.curated
+# belong to Flink -- ADR-004 #2's "only Flink writes to Iceberg" rule is about
+# table ownership, and it still holds: no dbt model writes to a table Flink
+# writes to. See ADR-006 #1.

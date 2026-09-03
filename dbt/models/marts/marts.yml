@@ -1,0 +1,141 @@
+version: 2
+
+# Generic test arguments nest under `arguments:` (dbt 1.12's required form);
+# `config:` stays a sibling, because severity is configuration rather than an
+# argument. See the note in staging.yml.
+
+models:
+  - name: fct_sessions
+    description: One row per session -- what a conversation cost and how it went.
+    columns:
+      - name: session_id
+        tests:
+          - not_null
+          - unique
+          # Every session in the mart must exist in staging. The reverse is
+          # guaranteed by construction (the mart groups staging), so this is the
+          # direction that can actually break -- e.g. if the mart ever grew a
+          # union or a join.
+          - relationships:
+              arguments:
+                to: ref('stg_trace_events')
+                field: session_id
+      - name: turn_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 1, inclusive: true}
+      - name: span_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 1, inclusive: true}
+      - name: error_count
+        tests:
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+      - name: total_cost_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+      - name: total_tokens
+        tests:
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+      - name: duration_ms
+        description: >
+          first-open to last-open. ts is stamped when a span OPENS, so this
+          misses the final span's own latency -- see the model.
+        tests:
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+
+  - name: fct_model_costs
+    description: >
+      Cost and latency by model and day, including the EXACT p95 that ADR-004 #6
+      deferred downstream. Grain: (event_day, model).
+    columns:
+      - name: event_day
+        tests: [not_null]
+      - name: model
+        description: >
+          Nullable by contract. This model filters to LLM_CALL so it is
+          populated in practice, but the column stays nullable because the
+          contract says so -- hence a warn rather than a gate.
+        tests:
+          - not_null:
+              config:
+                severity: warn
+      - name: calls
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 1, inclusive: true}
+      - name: cost_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+      - name: total_tokens
+        tests:
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, inclusive: true}
+      - name: latency_p95_ms
+        description: Exact nearest-rank p95 over every latency_ms in the group.
+        tests:
+          - not_null
+          # 600000 ms = 10 minutes. Not a guess at what is fast -- it is the
+          # bound past which a recorded span latency is a clock or units bug
+          # rather than a slow call.
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, max_value: 600000, inclusive: true}
+      - name: latency_avg_ms
+        tests:
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, max_value: 600000, inclusive: true}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_day, model]
+
+  - name: fct_tool_reliability
+    description: >
+      Call volume, failure and timeout rates, and latency by tool and day.
+      Grain: (event_day, tool_name).
+    columns:
+      - name: event_day
+        tests: [not_null]
+      - name: tool_name
+        tests: [not_null]
+      - name: calls
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 1, inclusive: true}
+      - name: error_rate
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, max_value: 1, inclusive: true}
+      - name: timeout_rate
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, max_value: 1, inclusive: true}
+      - name: latency_p95_ms
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments: {min_value: 0, max_value: 600000, inclusive: true}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_day, tool_name]
+      # timeout_count can never exceed error_count: the SDK's except-block
+      # forces status='error' before it records error_class, so every timeout is
+      # also an error. If this ever fails, the two are being derived from
+      # different rows.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "timeout_count <= error_count"

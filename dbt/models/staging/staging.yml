@@ -1,0 +1,84 @@
+version: 2
+
+# Generic test arguments are nested under `arguments:`, which is dbt 1.12's
+# required form -- the old flat style still runs but emits
+# MissingArgumentsPropertyInGenericTestDeprecation on every occurrence. `config:`
+# stays a sibling of `arguments:`: severity is test configuration, not a test
+# argument, and nesting it under arguments would silently make it a no-op.
+
+models:
+  - name: stg_trace_events
+    description: >
+      Every span, typed and projected. All 13 contract fields plus the derived
+      columns the marts share. ts_epoch_ms is renamed to ts here -- the one
+      rename, at the one projection boundary (ADR-005 #8's rule).
+    columns:
+      - name: span_id
+        description: uuid4 hex, unique per span (ADR-000 #4).
+        tests: [not_null, unique]
+      - name: trace_id
+        description: One trace per turn. count(distinct trace_id) IS the turn count.
+        tests: [not_null]
+      - name: session_id
+        description: One conversation; also the Kafka partition key.
+        tests: [not_null]
+      - name: ts
+        tests: [not_null]
+      - name: event_type
+        description: The Avro enum, which is genuinely closed -- so this test blocks.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [LLM_CALL, TOOL_CALL, RETRIEVAL, AGENT_STEP, GATEWAY, ERROR]
+      - name: status
+        description: >
+          Free-form by contract. The SDK promotes whatever set(status=...) is
+          handed it -- its own tests already cover "degraded" -- so this is a
+          WARN, not a gate. A new status value is news, not a build failure;
+          hard-failing here would make adding one a schema migration. This is
+          also why every consumer in the repo tests status != 'ok' rather than
+          status = 'error' (ADR-005 #2).
+        tests:
+          - accepted_values:
+              arguments:
+                values: [ok, error]
+              config:
+                severity: warn
+      - name: latency_ms
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: tool_name
+        description: >
+          Never null: services/sdk/telemetry.py builds attributes as
+          {"name": name, ...}, unconditionally, on every span. A null here means
+          something is writing to the topic that is not the SDK.
+        tests: [not_null]
+
+  - name: stg_agg_model_5m
+    description: >
+      The streaming 5-minute aggregate, typed, with the mean it implies. Nothing
+      downstream reads it -- it exists to be reconciled against raw, which is
+      what tests/assert_streamed_agg_does_not_overcount.sql does.
+    columns:
+      - name: window_start
+        tests: [not_null]
+      - name: event_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+    tests:
+      # A closed window is emitted exactly once per (event_type, model) group --
+      # the window TVF is append-only, which is the whole reason the Iceberg
+      # sink accepts it (see stream/flink/jobs/02_agg_model_5m.sql). A duplicate
+      # here would mean the append guarantee broke.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [window_start, event_type, model]

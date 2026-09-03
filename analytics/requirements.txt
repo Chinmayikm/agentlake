@@ -1,0 +1,28 @@
+# The dbt / Great Expectations / OpenLineage toolbox.
+#
+# This file exists separately from the repo's requirements.txt for one reason,
+# and it is not taste: agentlake runs Python 3.14 (CLAUDE.md), and none of these
+# can. dbt-core has no 3.14 support -- its mashumaro pin blocks it and
+# dbt-labs/dbt-core#12098 targets 1.12 for the fix -- and great-expectations
+# 1.22.0 declares Requires-Python >=3.10,<3.14 outright. So this set lives in a
+# python:3.12-slim container and never touches .venv. See ADR-006 #2.
+#
+# Pinned exactly, like every other dependency file here. dbt-core is NOT pinned
+# directly: it is resolved by dbt-trino, whose version tracks dbt-core's minor
+# line by design, and pinning both is how you get an unsatisfiable set on the
+# next adapter release. The resolved version is recorded in ADR-006.
+
+# The Trino adapter for dbt. Brings dbt-core, dbt-adapters and trino-python-client.
+dbt-trino==1.10.2
+
+# Great Expectations, over the same Trino. It reaches Trino through
+# trino.sqlalchemy.dialect, which arrives with the [sqlalchemy] extra of the
+# trino client -- dbt-trino installs the client but not that extra.
+great-expectations==1.22.0
+trino[sqlalchemy]==0.336.0
+
+# The dbt-ol wrapper. It is a POST-processor, not a plugin: it runs dbt, then
+# reads target/manifest.json and target/run_results.json and turns them into
+# OpenLineage events. Which is exactly why it can only ever see dbt nodes, and
+# why the Kafka -> raw edge has to be declared separately (ADR-006 #7).
+openlineage-dbt==1.53.0

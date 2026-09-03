@@ -1,0 +1,26 @@
+# Checked in, because it contains no secret: this Trino has no authentication,
+# for the same reason ClickHouse's `default` user is open (ADR-005 #1) -- a
+# credential here would be the only one in a stack whose Kafka is PLAINTEXT and
+# whose Qdrant is unauthenticated.
+#
+# Hostnames are container names: dbt runs INSIDE the compose network as a
+# one-shot `docker compose run --rm dbt`, so `trino` resolves and `localhost`
+# would not. The host-side equivalent is port 8085 (see docker-compose.yml).
+agentlake:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: dbt
+      host: "{{ env_var('AGENTLAKE_TRINO_HOST', 'trino') }}"
+      port: "{{ env_var('AGENTLAKE_TRINO_PORT', '8080') | int }}"
+      http_scheme: http
+      # `database` is dbt-trino's name for the Trino CATALOG. lake is the
+      # catalog Flink also writes through -- see analytics/trino/catalog/lake.properties.
+      database: lake
+      schema: analytics
+      # One connection. Trino is sized at a 800 MB heap on a 4 GB box and the
+      # marts are seconds of work; concurrency here buys nothing and can push
+      # the coordinator into its heap headroom.
+      threads: 1

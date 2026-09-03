@@ -1,7 +1,11 @@
 .PHONY: gateway traces \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
-        hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample
+        hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
+        analytics-build analytics-up analytics-down trino-shell \
+        dbt-build dbt-docs quality \
+        lineage-up lineage-down lineage \
+        analytics-verify analytics-session analytics-crosscheck seed
 
 gateway:
 	.venv/bin/uvicorn services.gateway.app:create_app --factory --reload --port 8100
@@ -99,11 +103,121 @@ ch-panels:
 ch-sample:
 	.venv/bin/python3 scripts/hot_path_verify.py sample
 
+# --- analytics: Iceberg -> Trino -> dbt marts (ADR-006) --------------------
+#
+# Order for a cold start. STOP THE COLD PATH FIRST -- Trino's JVM takes the
+# Flink cluster's place in the memory budget, and the analytics slice needs
+# neither Flink nor Kafka (it reads Iceberg through the same REST catalog):
+#
+#   make flink-stop                                  # if the jobs are running
+#   docker compose stop flink-jobmanager flink-taskmanager kafka schema-registry
+#   make analytics-build   # once: builds the dbt/GE/dbt-ol toolbox image
+#   make analytics-up      # trino (+ minio, iceberg-rest)
+#   make dbt-build         # dbt deps && dbt build -- 5 models, 54 tests
+#   make quality           # the Great Expectations gate; non-zero on failure
+#   make analytics-verify  # marts vs staging vs raw, with the numbers
+#
+# dbt and Great Expectations run INSIDE a container, and that is forced rather
+# than chosen: this repo is Python 3.14, dbt-core has no 3.14 support
+# (dbt-labs/dbt-core#12098) and great-expectations 1.22.0 declares <3.14.
+# See ADR-006 #2.
+
+analytics-build:
+	docker compose build dbt
+
+# `trino` is NAMED rather than relying on the profile alone, and that is worth
+# 745 MiB. kafka and schema-registry carry no `profiles:` key, so they start
+# under every bare `docker compose up` -- including `--profile analytics up -d`.
+# The analytics slice does not use them: it reads Iceberg through the REST
+# catalog and never touches the topic. Naming trino brings up exactly its
+# dependency chain (iceberg-rest -> minio-init -> minio) and nothing else.
+analytics-up:
+	docker compose --profile analytics up -d trino
+	$(MAKE) --no-print-directory analytics-wait
+
+# Trino accepts queries ~30s after the container starts, but the first query to
+# touch the Iceberg catalog also pays plugin init, the S3 client build and a
+# catalog round trip -- measured 28.2s cold against 0.4s warm. dbt-trino exposes
+# no request-timeout setting (the trino client's fixed 30s applies), so an
+# unwarmed build intermittently fails its first model with a read timeout.
+# Paying it here, deliberately, is ADR-000 #3's warmup argument again.
+analytics-wait:
+	.venv/bin/python3 scripts/analytics_verify.py wait
+
+analytics-down:
+	docker compose --profile analytics down
+
+trino-shell:
+	docker compose exec trino trino --catalog lake --schema analytics
+
+dbt-build:
+	docker compose run --rm dbt dbt deps
+	docker compose run --rm dbt dbt build
+
+# NFR: the quality gate exits non-zero when a BLOCKING expectation fails.
+# Warn-severity expectations are reported and never fail the build -- see the
+# blocking-vs-warn rule at the top of quality/checkpoint.py.
+quality:
+	docker compose run --rm --entrypoint python dbt /quality/checkpoint.py
+
+analytics-verify:
+	.venv/bin/python3 scripts/analytics_verify.py counts
+
+analytics-session:
+	.venv/bin/python3 scripts/analytics_verify.py session
+
+# Trino's EXACT p95 against ClickHouse's approximate quantile(0.95). Needs the
+# hot path too -- start ONLY clickhouse beside the analytics slice, not the
+# whole hotpath profile, and stop it again afterwards:
+#
+#   docker compose up -d clickhouse && make analytics-crosscheck
+#   docker compose stop clickhouse
+analytics-crosscheck:
+	.venv/bin/python3 scripts/analytics_verify.py crosscheck
+
+# Synthetic spans written straight into Iceberg through Trino, for a warehouse
+# with no Kafka and no Flink in front of it -- which is what CI has. REFUSES a
+# table that already holds rows unless --force.
+seed:
+	.venv/bin/python3 scripts/seed_iceberg.py seed --events 600 --seed 7
+
+# --- lineage: OpenLineage -> Marquez (ADR-006 #7) --------------------------
+#
+# Its own profile because these three containers are ~320 MiB that only the
+# lineage run needs:
+#
+#   make lineage-up && make lineage      # then http://localhost:3001
+#   make lineage-down
+#
+# `make lineage` does two things. dbt-ol runs the build and post-processes
+# target/manifest.json into OpenLineage events -- so it only ever sees dbt
+# nodes, and the graph would start at lake.raw.trace_events. emit_flink_lineage
+# adds the Kafka -> Iceberg edge in front of it, DECLARED from the job SQL
+# rather than captured from a running Flink job. See ADR-006 #7.
+
+# Named, for the same reason analytics-up names trino: a bare profile bring-up
+# would also start kafka and schema-registry, which lineage does not use.
+lineage-up:
+	docker compose --profile lineage up -d marquez marquez-web
+
+lineage-down:
+	docker compose --profile lineage stop marquez marquez-web marquez-db
+
+lineage:
+	.venv/bin/python3 scripts/emit_flink_lineage.py
+	docker compose run --rm \
+		-e OPENLINEAGE_URL=http://marquez:5000 \
+		-e OPENLINEAGE_NAMESPACE=agentlake \
+		dbt dbt-ol build
+
 # Flink dashboard: http://localhost:8082   (8081 is Schema Registry)
 # MinIO console:   http://localhost:9001
 # Iceberg REST:    http://localhost:8181/v1/config
 # Grafana:         http://localhost:3000   (anonymous Viewer; admin/admin to edit)
 # ClickHouse:      http://localhost:8123   (HTTP; native 9000 is container-only)
+# Trino:           http://localhost:8085   (8080 stays free -- see ADR-006 #1)
+# Marquez API:     http://localhost:5000/api/v1/namespaces
+# Marquez UI:      http://localhost:3001   (grafana owns 3000)
 #
 #   curl -s localhost:8123 --data-binary \
 #     "SELECT event_type, uniqExact(span_id) FROM agentlake.trace_events_rt GROUP BY event_type"

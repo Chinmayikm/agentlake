@@ -9,7 +9,10 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   lake.raw.trace_events and lake.curated.agg_model_5m. See stream/flink + ADR-004.
 - Hot path: ClickHouse Kafka engine -> agentlake.trace_events_rt (7-day TTL), with
   Grafana provisioned on top. See stream/clickhouse + dashboards/ + ADR-005.
-- Planned: Trino+dbt, Debezium CDC, eval harness
+- Analytics: Trino over the SAME Iceberg REST catalog Flink writes to -> dbt marts in
+  lake.analytics, a Great Expectations gate, OpenLineage lineage in Marquez.
+  See analytics/ + dbt/ + quality/ + ADR-006.
+- Planned: Debezium CDC, eval harness
 
 ## Compose profiles
 `docker-compose.yml` is sliced so only one heavy piece runs at a time (4 GB WSL cap):
@@ -33,9 +36,28 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
   start; the JVM heap is pinned in JAVA_OPTS because a Spring Boot app left to size
   itself off a 320 MB cgroup has no usable heap (same argument as ADR-004 #8).
 
-Run `streaming` OR `hotpath`, not both -- each is sized to fit beside the spine, not
-beside the other. They do not fight over host ports, so it is a memory decision.
-`tools` is small enough to sit beside either, but it is still opt-in.
+- `make analytics-up` -- + trino (and minio + iceberg-rest, which the `streaming`
+  profile shares). Measured: 853 MB across all three containers, host 2.0 of 3.9 GB --
+  the cheapest of the three slices. Port **Trino 8085** (container 8080 is remapped;
+  8080 stays free, same decision as kafka-ui). See ADR-006.
+- `make lineage-up` -- + marquez, marquez-web, marquez-db (the OpenLineage backend).
+  A further 245 MB, and only `make lineage` needs it, which is why it is its own
+  profile. Ports **Marquez API 5000**, **Marquez UI 3001** (grafana owns 3000).
+
+Run `streaming` OR `hotpath` OR `analytics`, not two at once -- each is sized to fit
+beside the spine, not beside another. They do not fight over host ports, so it is a
+memory decision. `tools` and `lineage` are small enough to sit beside one, but both
+are opt-in.
+
+**The analytics slice does not need kafka or schema-registry at all** -- it reads
+Iceberg through the REST catalog and never touches the topic. That is unique to it,
+and it is worth 745 MB, so `make analytics-up` NAMES its service
+(`docker compose --profile analytics up -d trino`) rather than bringing the profile up
+bare: kafka and schema-registry carry no `profiles:` key, so a bare `up` starts them
+under every profile. Stop them first:
+
+    make flink-stop            # only if the Flink jobs are running
+    docker compose stop flink-jobmanager flink-taskmanager kafka schema-registry
 
 ## Services
 - Telemetry SDK: services/sdk (`from services.sdk import session, span`). contextvars
@@ -126,6 +148,61 @@ beside the other. They do not fight over host ports, so it is a memory decision.
   so a restart resumes by itself and cannot replay into a populated table. A deliberate
   reset is `python -m stream.clickhouse.bootstrap --recreate` (destructive).
 
+- Analytics: analytics/ + dbt/ + quality/. Trino 483 over the SAME Iceberg REST catalog
+  the Flink jobs write through -- one catalog, two engines, so `lake.raw.trace_events`
+  is the same fully-qualified name in both. dbt builds two staging models and three
+  marts into `lake.analytics`; Great Expectations gates them; dbt-ol emits lineage.
+  Details: docs/adr/ADR-006.
+
+  **dbt and Great Expectations run in a container, and that is forced, not a style
+  choice**: this repo is Python 3.14, dbt-core has no 3.14 support yet
+  (dbt-labs/dbt-core#12098) and great-expectations 1.22.0 declares `<3.14`. So
+  `analytics/Dockerfile` pins a python:3.12 toolbox and every invocation is a
+  `docker compose run --rm dbt ...` -- the same one-shot pattern as flink-sql-client.
+  Nothing in .venv changes.
+
+  Cold start, in order (stop the cold path first -- Trino takes its place):
+
+      make analytics-build   # once: builds the dbt/GE/dbt-ol image
+      make analytics-up      # trino (+ minio, iceberg-rest), then warms the catalog
+      make dbt-build         # dbt deps && dbt build -- 5 models, 54 tests
+      make quality           # the GE gate; exits non-zero on a BLOCKING failure
+      make analytics-verify  # marts vs staging vs raw, with the numbers
+
+  Marts: `fct_sessions` (per session), `fct_model_costs` (model x day, with the EXACT
+  p95 that ADR-004 #6 deferred downstream), `fct_tool_reliability` (tool x day). 74
+  blocking checks across dbt and GE; `make analytics-session` hand-checks one row
+  against raw, and `make analytics-crosscheck` compares Trino's exact p95 against
+  ClickHouse's approximate `quantile(0.95)` (measured worst divergence 1.47%).
+
+  Three things that will bite otherwise, all in ADR-006 #8:
+
+  - `make analytics-up` ends with a warm-up query on purpose. Trino's first query
+    against Iceberg costs ~25s (plugin + S3 client + catalog) against 0.4s warm, and
+    dbt-trino exposes no request-timeout setting -- an unwarmed build intermittently
+    fails its first model on the client's fixed 30s.
+  - The catalog is SQLite and permits ONE writer. `CATALOG_CLIENTS: "1"` in
+    docker-compose.yml is what stops dbt racing it into `SQLITE_BUSY`; do not remove it.
+  - Staging models are tables, not views, because Trino cannot `CREATE VIEW` against an
+    Iceberg REST catalog -- and `on_table_exists` must stay `drop`, because
+    `CREATE OR REPLACE TABLE` fails deterministically on this catalog.
+
+  Lineage is a separate excursion, because Marquez is 245 MB nothing else needs:
+
+      make lineage-up && make lineage    # then http://localhost:3001
+      make lineage-down
+
+  `make lineage` does two things: `dbt-ol` captures the dbt run, and
+  `scripts/emit_flink_lineage.py` DECLARES the Kafka -> Iceberg edge in front of it,
+  parsed out of `stream/flink/jobs/*.sql`. dbt-ol is a post-processor over
+  target/manifest.json, so it can only ever see dbt nodes -- that edge is declared, not
+  captured, and ADR-006 #7 says so.
+
+  `scripts/seed_iceberg.py` writes synthetic spans straight into Iceberg through Trino,
+  for a warehouse with no Kafka or Flink in front of it (which is what CI has). It
+  REFUSES a populated table without `--force`. `inject-bad-row` / `revert-bad-row` are
+  the fault injector the quality gate is demonstrated against.
+
 ## Environment
 - WSL2 Ubuntu, 8 GB laptop, WSL capped at 4 GB -> every compose service needs mem_limit
 - Python 3.14 venv at .venv; run modules from repo root: python -m services.xyz
@@ -134,10 +211,15 @@ beside the other. They do not fight over host ports, so it is a memory decision.
 
 ## Tests & CI
 - `python -m pytest -q` -- no Kafka, Flink or Docker needed (injectable emitters block the Kafka path in
-  tests, see tests/conftest.py); `ruff check services/ tests/ stream/ scripts/` for lint (rule set pinned
-  in pyproject.toml)
-- CI (.github/workflows/ci.yml) on every PR: lint, test, and a schema-compat gate that
-  only runs when contracts/ changed
+  tests, see tests/conftest.py); `ruff check services/ tests/ stream/ scripts/ analytics/ quality/` for
+  lint (rule set pinned in pyproject.toml)
+- CI (.github/workflows/ci.yml) on every PR: lint, test, a schema-compat gate that only
+  runs when contracts/ changed, and a `quality` gate that only runs when the analytics
+  layer's inputs changed. The quality job runs the analytics slice FOR REAL on the
+  runner -- trino + iceberg-rest + minio, tables from `stream.flink.create_tables`,
+  rows from `scripts/seed_iceberg.py`, then `dbt build` and the GE checkpoint. It fits
+  because Kafka, Flink and Marquez are excluded; ADR-006 #10 records what that leaves
+  uncovered.
 
 ## Conventions
 - Trunk-based: feat/* branches, squash-merge PRs to main, conventional commits (feat:/fix:/docs:/test:/chore:)

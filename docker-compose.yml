@@ -105,7 +105,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: agentlake-minio
-    profiles: [streaming]
+    profiles: [streaming, analytics]
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"   # S3 API
@@ -123,7 +123,7 @@ services:
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: agentlake-minio-init
-    profiles: [streaming]
+    profiles: [streaming, analytics]
     depends_on: [minio]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentlake}
@@ -145,7 +145,7 @@ services:
     # what pins Iceberg to 1.10.1 everywhere else. See ADR-004 #1 and #7.
     image: apache/iceberg-rest-fixture:1.10.1
     container_name: agentlake-iceberg-rest
-    profiles: [streaming]
+    profiles: [streaming, analytics]
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -165,7 +165,24 @@ services:
       # user; Docker seeds a fresh named volume from the image directory it
       # covers, ownership included, so this is the one path here that a
       # non-root process can write into. (Same class of trap as KAFKA_LOG_DIRS.)
-      CATALOG_URI: jdbc:sqlite:/home/iceberg/catalog.db
+      #
+      # ?busy_timeout=30000 was added when Trino arrived (ADR-006 #8). This
+      # catalog is a JdbcCatalog on SQLite, and SQLite allows exactly one
+      # writer: with Flink alone that never mattered, because Flink writes
+      # table metadata roughly once per 30s checkpoint. dbt does not behave
+      # like that -- it creates and replaces five tables back to back -- and
+      # the fixture's default busy timeout is 0, so a concurrent catalog write
+      # fails IMMEDIATELY with SQLITE_BUSY rather than waiting. Trino surfaces
+      # that as ICEBERG_CATALOG_ERROR after six retries. 30s of patience turns
+      # a hard failure into a short wait.
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/catalog.db?busy_timeout=30000
+      # ONE connection in the catalog's JDBC pool, which is the fix that
+      # actually works. Iceberg's JdbcClientPool defaults to 2 (the `clients`
+      # catalog property, CatalogProperties.CLIENT_POOL_SIZE), and SQLite
+      # permits exactly one writer -- so two pooled connections are two writers
+      # racing for one file lock. Serialising the pool removes the race by
+      # construction rather than making the loser wait for it.
+      CATALOG_CLIENTS: "1"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentlake}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
       # S3FileIO's AWS SDK client refuses to build without a region even though
@@ -420,6 +437,138 @@ services:
       # works until it doesn't. The provider's options.path points here.
       - ./dashboards/json:/etc/grafana/dashboards:ro
 
+  # --- analytics (ADR-006): Iceberg -> Trino -> dbt marts --------------------
+
+  trino:
+    # Newest tag (2026-07-18). Trino has no LTS line -- it ships one numbered
+    # release a month and supports the newest -- so "pin the newest and say
+    # when" is the only honest pin available, unlike the clickhouse LTS choice.
+    image: trinodb/trino:483
+    container_name: agentlake-trino
+    profiles: [analytics]
+    # The SAME Iceberg REST catalog the Flink jobs write through, and the same
+    # MinIO underneath it. One catalog, two engines -- see ADR-006 #1 and
+    # analytics/trino/catalog/lake.properties.
+    depends_on: [iceberg-rest]
+    # Container-internal 8080 -> host 8085. 8080 is left free deliberately (the
+    # same reason kafka-ui is remapped to 8090), and discovery.uri has to name
+    # the container-internal port, so this is a publish-side remap only.
+    ports: ["8085:8080"]
+    environment:
+      # Read by analytics/trino/catalog/lake.properties via Trino's ${ENV:...}
+      # indirection, so the committed properties file names the credentials
+      # without containing them -- ADR-004 #9's argument, one engine over.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentlake}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agentlake-dev-secret}
+    # Three files, mounted one at a time. A directory mount at /etc/trino would
+    # hide node.properties and log.properties, which ship in the image and are
+    # not reproduced here -- the same trap as ClickHouse's config.d (ADR-005 #9)
+    # and Flink's /opt/flink/lib. A directory mount is a replacement, not a merge.
+    volumes:
+      - ./analytics/trino/config.properties:/etc/trino/config.properties:ro
+      - ./analytics/trino/jvm.config:/etc/trino/jvm.config:ro
+      - ./analytics/trino/catalog/lake.properties:/etc/trino/catalog/lake.properties:ro
+    mem_limit: 1024m
+    healthcheck:
+      # Trino's own readiness endpoint. It reports SERVER_STARTING for the
+      # ~20s the plugins take to load, and only then ACTIVE -- so `up -d`
+      # followed immediately by a query is otherwise a race.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+
+  # Not part of the `analytics` profile: a one-shot toolbox, driven by
+  # `docker compose run --rm dbt ...` (see the Makefile), which enables this
+  # service's own profile automatically. Exactly the flink-sql-client pattern.
+  #
+  # It exists as a container because it CANNOT be a venv: this repo runs Python
+  # 3.14, dbt-core has no 3.14 support yet (dbt-labs/dbt-core#12098) and
+  # great-expectations 1.22.0 declares >=3.10,<3.14. See ADR-006 #2.
+  dbt:
+    build:
+      context: ./analytics
+    image: agentlake-dbt:local
+    profiles: [dbt]
+    environment:
+      AGENTLAKE_TRINO_HOST: trino
+      AGENTLAKE_TRINO_PORT: "8080"
+      # dbt writes target/ (manifest.json, run_results.json) -- which is
+      # exactly what dbt-ol post-processes -- into the mounted project.
+      DBT_PROFILES_DIR: /dbt
+    working_dir: /dbt
+    mem_limit: 512m
+    volumes:
+      - ./dbt:/dbt
+      - ./quality:/quality:ro
+
+  # --- lineage (ADR-006 #7): OpenLineage events -> Marquez -------------------
+  #
+  # Its own profile, not part of `analytics`: these three containers are ~430
+  # MiB that only `make lineage` needs, and on a 4 GB box a slice should not
+  # start memory nobody asked for -- the same reasoning that moved qdrant into
+  # the `rag` profile (ADR-004 #8).
+
+  marquez-db:
+    image: postgres:16-alpine
+    container_name: agentlake-marquez-db
+    profiles: [lineage]
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    mem_limit: 192m
+    volumes:
+      - marquez_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  marquez:
+    # 0.51.1 is the newest tag and is from March 2025 -- Marquez has not shipped
+    # in a while. Pinned anyway: it is the OpenLineage reference implementation,
+    # and the events this repo emits are standard OpenLineage, so the backend is
+    # replaceable. Recorded as a maintenance risk in ADR-006 rather than hidden.
+    image: marquezproject/marquez:0.51.1
+    container_name: agentlake-marquez
+    profiles: [lineage]
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    ports: ["5000:5000"]   # 5001 is the admin port, deliberately not published
+    environment:
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+      POSTGRES_HOST: marquez-db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: marquez
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      JAVA_TOOL_OPTIONS: -Xmx320m
+    mem_limit: 512m
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.51.1
+    container_name: agentlake-marquez-web
+    profiles: [lineage]
+    depends_on: [marquez]
+    # Container-internal 3000 -> host 3001, because grafana owns host 3000.
+    # The two profiles are never up together, but a port collision that only
+    # appears when someone does run them together is not worth leaving in.
+    ports: ["3001:3000"]
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: "5000"
+      # Required, and the image will not start without it -- it exits with
+      # "WEB_PORT environment variable is not defined" rather than falling back
+      # to the port it is already listening on by convention. This is the
+      # container-internal port; the host mapping above is what makes it 3001.
+      WEB_PORT: "3000"
+    mem_limit: 128m
+
   # --- tools (on demand): a browser onto the topic itself ---------------------
 
   kafka-ui:
@@ -464,3 +613,4 @@ volumes:
   iceberg_catalog:
   clickhouse_data:
   grafana_data:
+  marquez_db:
