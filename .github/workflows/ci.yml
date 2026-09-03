@@ -133,17 +133,63 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         run: docker compose build dbt
 
-      # Trino accepts queries before its Iceberg catalog is warm, and dbt-trino
-      # exposes no request timeout. See scripts/analytics_verify.py::cmd_wait.
-      - name: Wait for Trino
+      # LIVENESS ONLY, and deliberately catalog-independent: `SELECT 1` is
+      # answered by the coordinator without touching Iceberg, so it says
+      # "Trino will accept a query" and nothing more. /v1/info reporting
+      # ACTIVE is not enough on its own -- the coordinator flips to ACTIVE a
+      # moment before it will actually run one -- hence the retry loop.
+      #
+      # It must not query lake.raw.trace_events: the table does not exist yet.
+      # A developer laptop hides that, because its catalog volume was created
+      # by an earlier run and still has the schemas; every CI run gets a
+      # virgin SQLite catalog where lake.raw does not exist at all, and the
+      # probe failed with SCHEMA_NOT_FOUND before anything had a chance to
+      # create it. Liveness first, then creation, then the catalog check.
+      - name: Wait for Trino (liveness, catalog-independent)
         if: steps.detect.outputs.changed == 'true'
-        run: python scripts/analytics_verify.py wait
+        run: |
+          python - <<'PY'
+          import sys, time
+          sys.path.insert(0, ".")
+          from analytics.trino_client import TrinoClient, TrinoError
+
+          client = TrinoClient()
+          client.wait_until_ready(seconds=120)
+          print(f"trino {client.url} ACTIVE")
+
+          last = "no attempt"
+          for attempt in range(1, 31):
+              try:
+                  client.execute("SELECT 1")
+              except TrinoError as exc:
+                  last = f"{type(exc).__name__}: {exc}"
+                  time.sleep(2.0)
+                  continue
+              print(f"trino answers SELECT 1 (attempt {attempt})")
+              sys.exit(0)
+          print(f"trino never answered SELECT 1 within 60s: {last}", file=sys.stderr)
+          sys.exit(1)
+          PY
 
       # The same script the cold path uses, so CI's tables are created by the
-      # code under test rather than by a CI-only copy of the schema.
+      # code under test rather than by a CI-only copy of the schema. It talks
+      # to the Iceberg REST catalog directly (not through Trino) and raises on
+      # any non-2xx, so a failure here is loud rather than silent -- it prints
+      # created/exists per table.
       - name: Create the Iceberg tables
         if: steps.detect.outputs.changed == 'true'
         run: python -m stream.flink.create_tables
+
+      # NOW the catalog check is meaningful, and it is the same one as before,
+      # not a weaker one: `analytics_verify.py wait` re-asserts ACTIVE and then
+      # counts lake.raw.trace_events, which both proves the table create_tables
+      # just made is visible through Trino and pays the ~25s Iceberg cold cost
+      # up front -- dbt-trino exposes no request timeout, so an unwarmed
+      # `dbt build` intermittently fails its first model on the client's fixed
+      # 30s. See scripts/analytics_verify.py::cmd_wait.
+      - name: Confirm lake.raw.trace_events exists and warm the catalog
+        if: steps.detect.outputs.changed == 'true'
+        run: python scripts/analytics_verify.py wait
 
       - name: Seed the warehouse
         if: steps.detect.outputs.changed == 'true'
