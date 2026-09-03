@@ -1,0 +1,8 @@
+# dbt_utils, for the three generic tests dbt-core does not ship: accepted_range,
+# unique_combination_of_columns and expression_is_true. Writing those three by
+# hand in macros/ was the alternative; the package is one pinned dependency that
+# every dbt reader already knows, and its SQL is plain enough to run on Trino
+# unchanged.
+packages:
+  - package: dbt-labs/dbt_utils
+    version: 1.3.0

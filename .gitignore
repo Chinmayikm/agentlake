@@ -16,3 +16,15 @@ stream/flink/.resume/
 services/rag/data/
 docs/private/
 data/
+
+# dbt build output. target/ holds compiled SQL plus manifest.json and
+# run_results.json -- which is exactly what dbt-ol post-processes into
+# OpenLineage events, so it is real output, but it is regenerable by
+# `make dbt-build`. dbt_packages/ is `dbt deps` (dbt_utils); package-lock.yml
+# IS committed, because it pins the resolved package version.
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+# Generated on first run: a random anonymous id dbt uses for its own telemetry.
+# Machine-local, not source.
+dbt/.user.yml

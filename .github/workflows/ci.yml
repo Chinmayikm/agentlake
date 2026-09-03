@@ -57,6 +57,168 @@ jobs:
       - name: pytest
         run: python -m pytest -q
 
+  # The analytics layer, run for real: Trino over Iceberg, the dbt models and
+  # tests, and the Great Expectations gate. See ADR-006 #10 for why this is a
+  # full ephemeral slice rather than a `dbt compile` smoke test -- the short
+  # version is that it fits comfortably BECAUSE Kafka, Flink and Marquez are all
+  # excluded, and what makes that possible is scripts/seed_iceberg.py writing
+  # the fixture straight into Iceberg through Trino.
+  #
+  # Not covered here, stated rather than implied: Flink-written data (there is
+  # no Flink; ADR-004 already verifies that path) and lineage emission (Marquez
+  # is another 320 MiB for a graph no assertion reads).
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # Same base-ref logic as contract-compat below, for the same reason: on a
+      # PR compare against the target branch; on a push to main, origin/main is
+      # the commit just pushed.
+      - name: Work out the base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="origin/main"
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Did anything the analytics layer depends on change?
+        id: detect
+        run: |
+          base="${{ steps.base.outputs.ref }}"
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "Base $base does not resolve; running the gate to be safe."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base"...HEAD -- \
+               dbt/ quality/ analytics/ stream/ contracts/ scripts/ \
+               docker-compose.yml .github/workflows/ci.yml | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only "$base"...HEAD -- \
+              dbt/ quality/ analytics/ stream/ contracts/ scripts/ \
+              docker-compose.yml .github/workflows/ci.yml
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing the analytics layer depends on changed -- skipping."
+          fi
+
+      - name: Install dependencies
+        if: steps.detect.outputs.changed == 'true'
+        run: pip install -r requirements-dev.txt
+
+      # Named services only. kafka and schema-registry carry no `profiles:` key,
+      # so a bare `--profile analytics up -d` would start them too -- naming
+      # trino brings up exactly trino plus its dependency chain
+      # (iceberg-rest -> minio-init -> minio) and nothing else.
+      - name: Start the analytics slice
+        if: steps.detect.outputs.changed == 'true'
+        run: docker compose --profile analytics up -d trino
+
+      - name: Build the dbt toolbox image
+        if: steps.detect.outputs.changed == 'true'
+        run: docker compose build dbt
+
+      # LIVENESS ONLY, and deliberately catalog-independent: `SELECT 1` is
+      # answered by the coordinator without touching Iceberg, so it says
+      # "Trino will accept a query" and nothing more. /v1/info reporting
+      # ACTIVE is not enough on its own -- the coordinator flips to ACTIVE a
+      # moment before it will actually run one -- hence the retry loop.
+      #
+      # It must not query lake.raw.trace_events: the table does not exist yet.
+      # A developer laptop hides that, because its catalog volume was created
+      # by an earlier run and still has the schemas; every CI run gets a
+      # virgin SQLite catalog where lake.raw does not exist at all, and the
+      # probe failed with SCHEMA_NOT_FOUND before anything had a chance to
+      # create it. Liveness first, then creation, then the catalog check.
+      - name: Wait for Trino (liveness, catalog-independent)
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          python - <<'PY'
+          import sys, time
+          sys.path.insert(0, ".")
+          from analytics.trino_client import TrinoClient, TrinoError
+
+          client = TrinoClient()
+          client.wait_until_ready(seconds=120)
+          print(f"trino {client.url} ACTIVE")
+
+          last = "no attempt"
+          for attempt in range(1, 31):
+              try:
+                  client.execute("SELECT 1")
+              except TrinoError as exc:
+                  last = f"{type(exc).__name__}: {exc}"
+                  time.sleep(2.0)
+                  continue
+              print(f"trino answers SELECT 1 (attempt {attempt})")
+              sys.exit(0)
+          print(f"trino never answered SELECT 1 within 60s: {last}", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+      # The same script the cold path uses, so CI's tables are created by the
+      # code under test rather than by a CI-only copy of the schema. It talks
+      # to the Iceberg REST catalog directly (not through Trino) and raises on
+      # any non-2xx, so a failure here is loud rather than silent -- it prints
+      # created/exists per table.
+      - name: Create the Iceberg tables
+        if: steps.detect.outputs.changed == 'true'
+        run: python -m stream.flink.create_tables
+
+      # NOW the catalog check is meaningful, and it is the same one as before,
+      # not a weaker one: `analytics_verify.py wait` re-asserts ACTIVE and then
+      # counts lake.raw.trace_events, which both proves the table create_tables
+      # just made is visible through Trino and pays the ~25s Iceberg cold cost
+      # up front -- dbt-trino exposes no request timeout, so an unwarmed
+      # `dbt build` intermittently fails its first model on the client's fixed
+      # 30s. See scripts/analytics_verify.py::cmd_wait.
+      - name: Confirm lake.raw.trace_events exists and warm the catalog
+        if: steps.detect.outputs.changed == 'true'
+        run: python scripts/analytics_verify.py wait
+
+      - name: Seed the warehouse
+        if: steps.detect.outputs.changed == 'true'
+        run: python scripts/seed_iceberg.py seed --events 600 --seed 7
+
+      - name: dbt build
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          docker compose run --rm dbt dbt deps
+          docker compose run --rm dbt dbt build
+
+      - name: Great Expectations gate
+        if: steps.detect.outputs.changed == 'true'
+        run: docker compose run --rm --entrypoint python dbt /quality/checkpoint.py
+
+      - name: Reconcile the marts
+        if: steps.detect.outputs.changed == 'true'
+        run: python scripts/analytics_verify.py counts
+
+      - name: Trino logs on failure
+        if: failure() && steps.detect.outputs.changed == 'true'
+        run: |
+          docker compose logs trino | tail -100
+          docker compose logs iceberg-rest | tail -50
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile analytics down -v
+
   contract-compat:
     runs-on: ubuntu-latest
     steps:
