@@ -25,7 +25,11 @@ class GatewayUnavailableError(Exception):
 
 class GatewayClient(Protocol):
     async def chat(
-        self, request: ChatRequest, *, session_id: str | None = None
+        self,
+        request: ChatRequest,
+        *,
+        session_id: str | None = None,
+        prompt_version: str | None = None,
     ) -> ChatResponse: ...
 
 
@@ -36,7 +40,13 @@ class HttpGatewayClient:
         ).rstrip("/")
         self._client = httpx.AsyncClient(timeout=timeout)
 
-    async def chat(self, request: ChatRequest, *, session_id: str | None = None) -> ChatResponse:
+    async def chat(
+        self,
+        request: ChatRequest,
+        *,
+        session_id: str | None = None,
+        prompt_version: str | None = None,
+    ) -> ChatResponse:
         headers = {"X-Session-Id": session_id} if session_id else {}
         # Cross-process trace propagation (ADR-003 #4): contextvars stop at
         # this process's boundary, so the GATEWAY span this call opens has no
@@ -47,6 +57,14 @@ class HttpGatewayClient:
         parent_span_id = current_parent_span_id()
         if parent_span_id:
             headers["X-Parent-Span-Id"] = parent_span_id
+        # A header, not a ChatRequest field, and the distinction is the point:
+        # this is telemetry metadata about the CALLER -- exactly like the three
+        # above -- not an instruction to the model. Putting it in the body would
+        # change /v1/chat's public contract and imply the gateway does something
+        # with it, when all it does is stamp it on the span it already opens.
+        # See ADR-007 #6.
+        if prompt_version:
+            headers["X-Prompt-Version"] = prompt_version
         try:
             resp = await self._client.post(
                 f"{self._base_url}/v1/chat",

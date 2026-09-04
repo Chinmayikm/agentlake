@@ -5,7 +5,9 @@
         analytics-build analytics-up analytics-down trino-shell \
         dbt-build dbt-docs quality \
         lineage-up lineage-down lineage \
-        analytics-verify analytics-session analytics-crosscheck seed
+        analytics-verify analytics-session analytics-crosscheck seed \
+        cdc-up cdc-down cdc-connector cdc-psql cdc-slot cdc-topic \
+        cdc-table cdc-land cdc-seed
 
 gateway:
 	.venv/bin/uvicorn services.gateway.app:create_app --factory --reload --port 8100
@@ -113,7 +115,7 @@ ch-sample:
 #   docker compose stop flink-jobmanager flink-taskmanager kafka schema-registry
 #   make analytics-build   # once: builds the dbt/GE/dbt-ol toolbox image
 #   make analytics-up      # trino (+ minio, iceberg-rest)
-#   make dbt-build         # dbt deps && dbt build -- 5 models, 54 tests
+#   make dbt-build         # dbt deps && dbt build -- 7 models, 71 tests
 #   make quality           # the Great Expectations gate; non-zero on failure
 #   make analytics-verify  # marts vs staging vs raw, with the numbers
 #
@@ -180,6 +182,68 @@ analytics-crosscheck:
 # table that already holds rows unless --force.
 seed:
 	.venv/bin/python3 scripts/seed_iceberg.py seed --events 600 --seed 7
+
+# --- cdc: Postgres -> Debezium -> Kafka -> Iceberg (ADR-007) ---------------
+#
+# Unlike `make analytics-up`, this one does NOT name its services: the cdc slice
+# genuinely needs kafka and schema-registry, so a bare profile bring-up starting
+# them too is right rather than wasteful.
+#
+# TWO PHASES, and the split is a memory decision measured rather than guessed.
+# Capture (metadata-db + connect) costs ~535 MiB and landing needs the analytics
+# slice's 853; both at once plus kafka leaves too little for dbt's 512 MiB
+# toolbox on a 3.9 GB box. Kafka keeps the topic between them, so stopping the
+# capture side loses nothing:
+#
+#   PHASE 1 -- capture
+#     make cdc-up          # metadata-db -> metadata-init -> connect
+#     make cdc-connector   # idempotent PUT; snapshot.mode=initial fires here
+#     make cdc-topic       # what Debezium actually emitted
+#     ...make changes with `make cdc-psql`...
+#     docker compose stop connect metadata-db
+#
+#   PHASE 2 -- land and model (Flink must be stopped; Trino takes its place)
+#     make analytics-up
+#     make cdc-table       # once: creates lake.cdc.prompt_versions
+#     make cdc-land        # drain the topic into Iceberg, resumably
+#     make dbt-build && make quality && make analytics-verify
+
+cdc-up:
+	docker compose --profile cdc up -d
+
+cdc-down:
+	docker compose --profile cdc down
+
+cdc-connector:
+	.venv/bin/python3 scripts/register_connector.py
+
+cdc-psql:
+	docker compose exec metadata-db psql -U agentlake -d agentlake
+
+# The classic production failure mode, in one query (ADR-007 #5). restart_lsn is
+# what actually pins WAL on disk; confirmed_flush_lsn is only how far the
+# consumer has acknowledged, and it catches up FIRST. Watching the wrong one
+# reports "caught up" while megabytes are still retained.
+cdc-slot:
+	docker compose exec -T metadata-db psql -U agentlake -d agentlake -c "\
+	SELECT slot_name, active, restart_lsn, confirmed_flush_lsn, \
+	       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal \
+	  FROM pg_replication_slots;"
+
+cdc-topic:
+	.venv/bin/python3 scripts/cdc_verify.py topic
+
+cdc-table:
+	.venv/bin/python3 scripts/cdc_land.py create-table
+
+cdc-land:
+	.venv/bin/python3 scripts/cdc_land.py land
+
+# Synthetic changelog rows for a warehouse with no Kafka in front of it, which
+# is what CI has. Refuses a populated table without --force, exactly like
+# `make seed`.
+cdc-seed:
+	.venv/bin/python3 scripts/cdc_land.py seed
 
 # --- lineage: OpenLineage -> Marquez (ADR-006 #7) --------------------------
 #

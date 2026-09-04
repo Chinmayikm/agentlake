@@ -82,3 +82,40 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: [window_start, event_type, model]
+
+  - name: stg_prompt_versions
+    description: >
+      The current state of public.prompt_versions, resolved from the Debezium
+      changelog by taking the latest record per primary key. Deleted rows are
+      KEPT, carrying is_deleted -- the facts they explain are historical, and
+      dropping them would turn a retired prompt into the same "unknown" state
+      that means the CDC lander is broken. See ADR-007 #4.
+    columns:
+      - name: prompt_version_id
+        description: >
+          The Postgres primary key, and this model's grain. Unique by
+          construction, since ROW_NUMBER() partitions by it -- so a duplicate
+          means the window function changed, not that the data did.
+        tests: [not_null, unique]
+      - name: version
+        description: >
+          The exact string services/gateway stamps into
+          attributes['prompt_version'], and the join key of
+          fct_cost_by_prompt. NOT NULL blocks: metadata/sql/02_prompt_versions.sql
+          declares the column NOT NULL and REPLICA IDENTITY FULL keeps it
+          populated even on a delete's before-image, so a null here can only
+          mean the connector's replica identity regressed.
+        tests: [not_null]
+      - name: last_op
+        description: >
+          The Debezium operation of the winning record. Genuinely closed once
+          the lander has dropped 't' (TRUNCATE) and 'm' (logical decoding
+          message), neither of which carries a row image -- so unlike
+          accepted_values on `status`, this one gates.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [c, u, d, r]
+      - name: is_deleted
+        tests: [not_null]

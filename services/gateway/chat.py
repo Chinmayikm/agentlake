@@ -224,6 +224,12 @@ async def chat(
     x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
     x_trace_id: str | None = Header(default=None, alias="X-Trace-Id"),
     x_parent_span_id: str | None = Header(default=None, alias="X-Parent-Span-Id"),
+    # Telemetry metadata about the caller, like the three headers above, and
+    # deliberately not a ChatRequest field: the gateway does nothing with it
+    # except stamp it on the LLM_CALL span it already opens. services/agent
+    # sends it; anything else calling /v1/chat simply omits it and the
+    # attribute is absent rather than null. See ADR-007 #6.
+    x_prompt_version: str | None = Header(default=None, alias="X-Prompt-Version"),
     client: anthropic.AsyncAnthropic = Depends(get_anthropic_client),
     price_table: PriceTable = Depends(get_price_table),
     stats: GatewayStats = Depends(get_stats),
@@ -252,12 +258,21 @@ async def chat(
                 x_session_id,
                 x_trace_id,
                 x_parent_span_id,
+                x_prompt_version,
             ),
             media_type="text/event-stream",
         )
 
     return await chat_once(
-        payload, model_cfg, price_table, stats, client, x_session_id, x_trace_id, x_parent_span_id
+        payload,
+        model_cfg,
+        price_table,
+        stats,
+        client,
+        x_session_id,
+        x_trace_id,
+        x_parent_span_id,
+        x_prompt_version,
     )
 
 
@@ -270,6 +285,7 @@ async def chat_once(
     x_session_id: str | None,
     x_trace_id: str | None = None,
     x_parent_span_id: str | None = None,
+    x_prompt_version: str | None = None,
 ) -> JSONResponse | ChatResponse:
     try:
         with (
@@ -282,7 +298,13 @@ async def chat_once(
                 trace_id=x_trace_id,
                 parent_span_id=x_parent_span_id,
             ),
-            span("LLM_CALL", "anthropic_messages") as llm,
+            # prompt_version rides in at span-open rather than in
+            # record_usage(), and that is the whole reason it is here:
+            # record_usage is not reached when the provider call raises, and an
+            # LLM call that FAILED under a given prompt version is exactly the
+            # thing you want attributed to it. _coerce_attrs drops a None, so a
+            # request with no header emits a byte-identical span to before.
+            span("LLM_CALL", "anthropic_messages", prompt_version=x_prompt_version) as llm,
         ):
             message = await client.messages.create(**provider_kwargs(payload, model_cfg))
             cost = record_usage(
@@ -328,6 +350,7 @@ async def stream_chat(
     x_session_id: str | None,
     x_trace_id: str | None = None,
     x_parent_span_id: str | None = None,
+    x_prompt_version: str | None = None,
 ) -> AsyncIterator[str]:
     with session_ctx(x_session_id):
         try:
@@ -339,7 +362,10 @@ async def stream_chat(
                 trace_id=x_trace_id,
                 parent_span_id=x_parent_span_id,
             ):
-                with span("LLM_CALL", "anthropic_messages") as llm:
+                # Same argument as the non-streaming path above.
+                with span(
+                    "LLM_CALL", "anthropic_messages", prompt_version=x_prompt_version
+                ) as llm:
                     async with client.messages.stream(
                         **provider_kwargs(payload, model_cfg)
                     ) as stream_mgr:

@@ -139,3 +139,66 @@ models:
       - dbt_utils.expression_is_true:
           arguments:
             expression: "timeout_count <= error_count"
+
+  - name: fct_cost_by_prompt
+    description: >
+      Cost, turns and tokens by prompt version and day -- the join between the
+      CDC dimension (Postgres -> Debezium -> Iceberg) and the trace facts.
+      Grain: (event_day, prompt_version), where a NULL prompt_version is a REAL
+      group -- the LLM_CALL spans carrying no prompt_version attribute -- exactly
+      as a NULL model is a real group in fct_model_costs. See ADR-007 #6.
+    columns:
+      - name: event_day
+        tests: [not_null]
+      - name: prompt_attribution
+        description: >
+          known | unversioned | unknown. Produced by a CASE with exactly three
+          arms, so a fourth value means the model changed under the gate --
+          this blocks.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [known, unversioned, unknown]
+      - name: prompt_version
+        description: >
+          Nullable on purpose -- see the model. dbt's relationships test excludes
+          NULLs on the child side, so this asserts exactly the interesting
+          thing: every NON-NULL version the traces carry exists in the
+          dimension. It WARNS, because a prompt created in Postgres since the
+          last `make cdc-land` is legitimately absent, and that is ADR-006 #6's
+          "depends on when it last ran" rule verbatim.
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_prompt_versions')
+                field: version
+              config:
+                severity: warn
+      - name: calls
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: turns
+        tests: [not_null]
+      - name: cost_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_day, prompt_version]
+      # turns is count(distinct trace_id) over the same rows count(*) counts, so
+      # a turn cannot outnumber its own calls. Same shape as fct_sessions'
+      # span_count >= turn_count and fct_tool_reliability's
+      # timeout_count <= error_count.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "turns <= calls"

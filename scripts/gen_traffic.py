@@ -65,8 +65,14 @@ def load_models() -> list[str]:
     return ids or ["claude-haiku-4-5"]
 
 
-def ok_turn(turn: int, model: str) -> None:
-    with span("AGENT_STEP", "agent_turn", turn=turn, question=random.choice(QUESTIONS)) as step:
+def ok_turn(turn: int, model: str, prompt_version: str) -> None:
+    with span(
+        "AGENT_STEP",
+        "agent_turn",
+        turn=turn,
+        question=random.choice(QUESTIONS),
+        prompt_version=prompt_version,
+    ) as step:
         with span("RETRIEVAL", "vector_search", index="docs-v1", top_k=4) as retrieval:
             time.sleep(random.uniform(0.001, 0.006))
             retrieval.set(hits=random.randint(1, 4))
@@ -80,6 +86,11 @@ def ok_turn(turn: int, model: str) -> None:
                 completion_tokens=completion_tokens,
                 cost_usd=round(prompt_tokens * 1e-6 + completion_tokens * 5e-6, 6),
                 finish_reason="stop",
+                # The attribute lake.analytics.fct_cost_by_prompt joins on and
+                # the quality dashboard groups by. Set on the LLM_CALL span,
+                # not just AGENT_STEP, because this is the span that carries
+                # cost_usd and the tokens -- see ADR-007 #6.
+                prompt_version=prompt_version,
             )
         step.set(turn_result="answered")
 
@@ -114,6 +125,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--seed", type=int, default=None, help="seed the RNG for a reproducible run"
+    )
+    parser.add_argument(
+        "--prompt-version",
+        default="v3",
+        help="stamp this prompt_version on every AGENT_STEP and LLM_CALL span "
+        "(default: %(default)s). Lets the quality dashboard and "
+        "fct_cost_by_prompt be populated without running the gateway or "
+        "spending anything at a provider.",
     )
     parser.add_argument(
         "--spread",
@@ -151,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                     error_turn(turn)
                     emitted += SPANS_PER_ERR_TURN
                 else:
-                    ok_turn(turn, random.choice(models))
+                    ok_turn(turn, random.choice(models), args.prompt_version)
                     emitted += SPANS_PER_OK_TURN
                 if pause:
                     time.sleep(pause)

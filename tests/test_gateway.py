@@ -207,6 +207,91 @@ def test_chat_cost_matches_price_table(app_and_client, events):
 
 
 # ---------------------------------------------------------------------------
+# 2a. X-Prompt-Version header -> the LLM_CALL span carries it (ADR-007 #6)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_version_header_lands_on_the_llm_span(app_and_client, events):
+    """The other half of the one-attribute promise.
+
+    services/agent sends X-Prompt-Version; the gateway stamps it on the span
+    that also carries cost_usd and the token counts. That pairing is the whole
+    point -- it is what lets `sum(cost_usd) / uniqExact(trace_id)` grouped by
+    prompt_version be a real number rather than zero.
+
+    Set at span-OPEN rather than in record_usage(), which is why this test also
+    checks the failure path below: record_usage is never reached when the
+    provider raises, and an LLM call that failed under a given prompt version is
+    exactly what you want attributed to it.
+    """
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Prompt-Version": "v3"},
+        )
+
+    assert r.status_code == 200, r.text
+    llm_events = [e for e in events if e["event_type"] == "LLM_CALL"]
+    assert llm_events[0]["attributes"]["prompt_version"] == "v3"
+    # The cost is on the SAME span. Asserted together because a version on a
+    # span with no cost is the failure mode this design exists to avoid.
+    assert llm_events[0]["cost_usd"] is not None
+    assert llm_events[0]["cost_usd"] > 0
+
+
+def test_prompt_version_is_absent_not_null_without_the_header(app_and_client, events):
+    """A caller that sends no header must produce a byte-identical span to
+    before this feature existed. _coerce_attrs drops a None, so the key is
+    absent rather than present-and-empty -- which matters because the Grafana
+    panels filter on `attributes['prompt_version'] != ''` and ClickHouse returns
+    '' for a missing map key either way, but the Iceberg/Trino side would
+    otherwise gain a NULL-valued map entry the contract says cannot exist
+    (the attributes map is value-required)."""
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert r.status_code == 200, r.text
+    llm_events = [e for e in events if e["event_type"] == "LLM_CALL"]
+    assert "prompt_version" not in llm_events[0]["attributes"]
+
+
+def test_prompt_version_survives_a_failed_provider_call(app_and_client, events):
+    """The reason the attribute is set at span-open rather than in
+    record_usage(): record_usage is never reached when the provider raises, so
+    stamping it there would attribute successes to a prompt version and leave
+    its failures anonymous -- precisely backwards for the question "did v4 make
+    things worse".
+    """
+    fake = FakeMessages(exception=fake_rate_limit_error(retry_after="7"))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Prompt-Version": "v4"},
+        )
+
+    assert r.status_code == 429, r.text
+    llm_events = [e for e in events if e["event_type"] == "LLM_CALL"]
+    assert llm_events[0]["attributes"]["prompt_version"] == "v4"
+    # The SDK's own except-block set this, and the attribution rides with it.
+    assert llm_events[0]["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
 # 3. X-Session-Id header -> both spans carry that session_id
 # ---------------------------------------------------------------------------
 

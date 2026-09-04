@@ -42,7 +42,12 @@ CHECKPOINT_PY = REPO_ROOT / "quality" / "checkpoint.py"
 LINEAGE_PY = REPO_ROOT / "scripts" / "emit_flink_lineage.py"
 COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
 
-MARTS = ("fct_sessions", "fct_model_costs", "fct_tool_reliability")
+MARTS = (
+    "fct_sessions",
+    "fct_model_costs",
+    "fct_tool_reliability",
+    "fct_cost_by_prompt",
+)
 
 
 def _yaml(path: Path) -> dict[str, Any]:
@@ -232,9 +237,16 @@ def test_blocking_test_count_meets_the_bar() -> None:
     declared = _tests_declared_for(STAGING_YML) | _tests_declared_for(MARTS_YML)
     singular = len(list((DBT_DIR / "tests").glob("*.sql")))
 
-    # Two dbt tests are severity: warn on purpose -- accepted_values on the
-    # free-form `status` string, and not_null on the contract-nullable `model`.
-    warn = 2
+    # Three dbt tests are severity: warn on purpose -- accepted_values on the
+    # free-form `status` string, not_null on the contract-nullable `model`, and
+    # the relationships test from fct_cost_by_prompt.prompt_version to the CDC
+    # dimension, which is legitimately unsatisfied between a prompt being
+    # created in Postgres and `make cdc-land` next running (ADR-007 #6).
+    #
+    # This number is load-bearing and fails QUIETLY if left stale: the assertion
+    # below is `>= 15`, so a wrong `warn` still passes, with a blocking count
+    # that ADR-006 #6 then quotes as "counted, not claimed" and gets wrong.
+    warn = 3
     dbt_blocking = sum(declared.values()) + singular - warn
 
     checkpoint = CHECKPOINT_PY.read_text(encoding="utf-8")
@@ -245,7 +257,7 @@ def test_blocking_test_count_meets_the_bar() -> None:
     )
 
 
-def test_checkpoint_covers_exactly_the_three_marts() -> None:
+def test_checkpoint_covers_every_mart() -> None:
     checkpoint = CHECKPOINT_PY.read_text(encoding="utf-8")
     for mart in MARTS:
         assert f'table="{mart}"' in checkpoint, f"quality/checkpoint.py does not cover {mart}"

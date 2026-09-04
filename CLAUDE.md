@@ -12,7 +12,10 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
 - Analytics: Trino over the SAME Iceberg REST catalog Flink writes to -> dbt marts in
   lake.analytics, a Great Expectations gate, OpenLineage lineage in Marquez.
   See analytics/ + dbt/ + quality/ + ADR-006.
-- Planned: Debezium CDC, eval harness
+- CDC: Postgres metadata DB -> Debezium (pgoutput) -> cdc.metadata.* topics ->
+  lake.cdc.prompt_versions -> dbt dimension + the fct_cost_by_prompt join.
+  See metadata/ + scripts/cdc_land.py + ADR-007.
+- Planned: eval harness
 
 ## Compose profiles
 `docker-compose.yml` is sliced so only one heavy piece runs at a time (4 GB WSL cap):
@@ -43,11 +46,26 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
 - `make lineage-up` -- + marquez, marquez-web, marquez-db (the OpenLineage backend).
   A further 245 MB, and only `make lineage` needs it, which is why it is its own
   profile. Ports **Marquez API 5000**, **Marquez UI 3001** (grafana owns 3000).
+- `make cdc-up` (`docker compose --profile cdc up -d`) -- + metadata-db,
+  metadata-init (one-shot), connect. Measured: connect 478 MB of a 640 MB limit,
+  metadata-db 57 MB of 256 MB; 1161 MB across all four containers with the spine,
+  host 2.1 of 3.9 GB. Ports: **Postgres 5433** (5432 left free for a local one),
+  **Kafka Connect 8083**. See ADR-007.
+
+  Unlike `make analytics-up` this one does NOT name its services, and that is the
+  right call rather than an oversight: the cdc slice genuinely needs kafka and
+  schema-registry, so a bare profile bring-up starting them too is what you want.
+
+  **Capture and landing are two phases, and the split is measured, not stylistic.**
+  Capture (metadata-db + connect) is ~535 MB and landing needs the analytics
+  slice's 853; both at once plus kafka leaves too little for dbt's 512 MB toolbox.
+  Kafka keeps the topic in between, so stopping the capture side loses nothing.
 
 Run `streaming` OR `hotpath` OR `analytics`, not two at once -- each is sized to fit
 beside the spine, not beside another. They do not fight over host ports, so it is a
 memory decision. `tools` and `lineage` are small enough to sit beside one, but both
-are opt-in.
+are opt-in. `cdc` is a fourth slice: it fits beside any ONE of the three, and it
+never needs `streaming` at all.
 
 **The analytics slice does not need kafka or schema-registry at all** -- it reads
 Iceberg through the REST catalog and never touches the topic. That is unique to it,
@@ -150,7 +168,7 @@ under every profile. Stop them first:
 
 - Analytics: analytics/ + dbt/ + quality/. Trino 483 over the SAME Iceberg REST catalog
   the Flink jobs write through -- one catalog, two engines, so `lake.raw.trace_events`
-  is the same fully-qualified name in both. dbt builds two staging models and three
+  is the same fully-qualified name in both. dbt builds three staging models and four
   marts into `lake.analytics`; Great Expectations gates them; dbt-ol emits lineage.
   Details: docs/adr/ADR-006.
 
@@ -165,15 +183,16 @@ under every profile. Stop them first:
 
       make analytics-build   # once: builds the dbt/GE/dbt-ol image
       make analytics-up      # trino (+ minio, iceberg-rest), then warms the catalog
-      make dbt-build         # dbt deps && dbt build -- 5 models, 54 tests
+      make dbt-build         # dbt deps && dbt build -- 7 models, 71 tests
       make quality           # the GE gate; exits non-zero on a BLOCKING failure
       make analytics-verify  # marts vs staging vs raw, with the numbers
 
   Marts: `fct_sessions` (per session), `fct_model_costs` (model x day, with the EXACT
-  p95 that ADR-004 #6 deferred downstream), `fct_tool_reliability` (tool x day). 74
-  blocking checks across dbt and GE; `make analytics-session` hand-checks one row
-  against raw, and `make analytics-crosscheck` compares Trino's exact p95 against
-  ClickHouse's approximate `quantile(0.95)` (measured worst divergence 1.47%).
+  p95 that ADR-004 #6 deferred downstream), `fct_tool_reliability` (tool x day), and
+  `fct_cost_by_prompt` (prompt version x day -- the CDC join, ADR-007).
+  `make analytics-session` hand-checks one row against raw, and
+  `make analytics-crosscheck` compares Trino's exact p95 against ClickHouse's
+  approximate `quantile(0.95)` (measured worst divergence 1.47%).
 
   Three things that will bite otherwise, all in ADR-006 #8:
 
@@ -203,6 +222,64 @@ under every profile. Stop them first:
   REFUSES a populated table without `--force`. `inject-bad-row` / `revert-bad-row` are
   the fault injector the quality gate is demonstrated against.
 
+- CDC: metadata/ + scripts/cdc_land.py + scripts/register_connector.py. A Postgres 16
+  metadata database (prompt_versions, golden_examples, eval_runs, eval_results) with
+  `wal_level=logical`; Debezium 3.0.8.Final on Kafka Connect streams its WAL through
+  the **pgoutput** plugin onto `cdc.metadata.<table>`. Day 5's eval harness writes
+  those tables -- this slice builds the tables and the pipeline, not the harness.
+  Details: docs/adr/ADR-007.
+
+  **The landing path is a batch pull, not a Flink job, and ADR-007 #3 argues it.**
+  A Debezium changelog is an *updating* stream and ADR-004's Iceberg sink is
+  append-only, so Flink would mean upsert mode with v2 equality deletes -- a
+  mechanism nothing else here uses -- to maintain a table of tens of rows. And
+  `streaming` (1790 MB) + `cdc` (535) + the `analytics` slice dbt needs (853) does
+  not fit in 3.9 GB. `scripts/cdc_land.py` is a confluent-kafka consumer feeding
+  `INSERT`s through the existing TrinoClient; offsets live in the consumer group
+  `agentlake-cdc-land`, so it resumes.
+
+  Cold start, in order. PHASE 1 -- capture:
+
+      make cdc-up          # metadata-db -> metadata-init (one-shot) -> connect
+      make cdc-connector   # idempotent PUT; snapshot.mode=initial fires here
+      make cdc-topic       # what Debezium actually emitted, record by record
+      make cdc-psql        # ...make changes...
+      docker compose stop connect metadata-db
+
+  PHASE 2 -- land and model (stop the cold path first; Trino takes its place):
+
+      make analytics-up
+      make cdc-table       # once: creates lake.cdc.prompt_versions
+      make cdc-land        # drain the topic into Iceberg
+      make dbt-build && make quality && make analytics-verify
+
+  Migrations are `metadata/sql/*.sql` applied by the `metadata-init` one-shot in
+  **filename order**, which is load-bearing the same way `stream/clickhouse/sql/`'s
+  prefixes are: the role before the grants, the tables before the publication that
+  names them, the seed last so the initial snapshot has something to carry. Every
+  file is safe to re-apply, because metadata-init runs on every bring-up.
+
+  Four things that will bite otherwise, all in ADR-007:
+
+  - **`lake.cdc`, not `lake.raw`.** ADR-006 #1's ownership table says lake.raw is
+    written by Flink. A third namespace keeps that sentence true.
+  - **`REPLICA IDENTITY FULL` on prompt_versions** (metadata/sql/02). Without it a
+    DELETE's `before` image is the primary key and nothing else, so a deleted row
+    lands with no `version` and stops joining -- indistinguishable from a lander
+    that never ran.
+  - **`restart_lsn`, not `confirmed_flush_lsn`, is what pins WAL.** `make cdc-slot`
+    prints both. Measured across a 44s connector outage: retained WAL grew
+    273 kB -> 1493 kB and did not fall when the connector reconnected;
+    confirmed_flush_lsn caught up in seconds while restart_lsn took ~2m20s more.
+    Monitoring the wrong one reports "caught up" with megabytes still retained.
+  - **The CDC topics are NOT in the Schema Registry**, unlike traces.events.v1: the
+    Debezium image does not ship Confluent's Avro converter (Confluent Community
+    License), so they carry JSON with `schemas.enable=false`. ADR-007 #2.
+
+  `scripts/cdc_land.py seed` writes synthetic changelog rows for a warehouse with
+  no Kafka in front of it (which is what CI has), refusing a populated table
+  without `--force` -- the same fence `scripts/seed_iceberg.py` has.
+
 ## Environment
 - WSL2 Ubuntu, 8 GB laptop, WSL capped at 4 GB -> every compose service needs mem_limit
 - Python 3.14 venv at .venv; run modules from repo root: python -m services.xyz
@@ -211,15 +288,17 @@ under every profile. Stop them first:
 
 ## Tests & CI
 - `python -m pytest -q` -- no Kafka, Flink or Docker needed (injectable emitters block the Kafka path in
-  tests, see tests/conftest.py); `ruff check services/ tests/ stream/ scripts/ analytics/ quality/` for
+  tests, see tests/conftest.py); `ruff check services/ tests/ stream/ scripts/ analytics/ quality/ metadata/` for
   lint (rule set pinned in pyproject.toml)
 - CI (.github/workflows/ci.yml) on every PR: lint, test, a schema-compat gate that only
   runs when contracts/ changed, and a `quality` gate that only runs when the analytics
   layer's inputs changed. The quality job runs the analytics slice FOR REAL on the
   runner -- trino + iceberg-rest + minio, tables from `stream.flink.create_tables`,
-  rows from `scripts/seed_iceberg.py`, then `dbt build` and the GE checkpoint. It fits
-  because Kafka, Flink and Marquez are excluded; ADR-006 #10 records what that leaves
-  uncovered.
+  rows from `scripts/seed_iceberg.py` and `scripts/cdc_land.py seed`, then `dbt build`
+  and the GE checkpoint. It fits because Kafka, Flink and Marquez are excluded;
+  ADR-006 #10 records what that leaves uncovered, and ADR-007 #10 adds that CI runs
+  neither Postgres nor Debezium -- capture is covered by ADR-007's verification log,
+  not by CI.
 
 ## Conventions
 - Trunk-based: feat/* branches, squash-merge PRs to main, conventional commits (feat:/fix:/docs:/test:/chore:)

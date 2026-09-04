@@ -77,10 +77,14 @@ number.
   cannot trim what you cannot see.
 - **Regressions get caught before they compound.** A prompt change that doubles context
   length costs nothing in review and plenty at volume. `Cost per turn by prompt version`
-  and `Tokens per turn by prompt version` are built and query
-  `attributes['prompt_version']` — they return no rows today because nothing emits that
-  attribute yet. Emit it from one `span.set()` and they populate with no dashboard
-  change. The eval gate that would block quality regressions in CI is roadmap, not built.
+  and `Tokens per turn by prompt version` query `attributes['prompt_version']`, and as
+  of [ADR-007](docs/adr/ADR-007-cdc-metadata.md) they populate: `services/agent` stamps
+  the version and the gateway carries it onto the LLM span, which is the one holding
+  cost and tokens. Measured across three real turns — v3 at **$0.0640/turn** over
+  59,292 tokens, v4 at **$0.1554/turn** over 149,476. Which prompt each version *is*
+  comes from a Postgres metadata database streamed in by Debezium, so
+  `lake.analytics.fct_cost_by_prompt` is a join, not a string. The eval gate that would
+  block quality regressions in CI is roadmap, not built.
 - **The observability itself is the cheap part.** Self-hosted on open components, with
   no per-seat or per-trace pricing, and the marginal cost of a span is a local Kafka
   produce: measured at roughly 0.3 ms once the producer is warm, against a first emit of
@@ -269,33 +273,41 @@ Every non-obvious choice is written down, with what it cost as well as what it b
 | [ADR-003](docs/adr/ADR-003-agent-mcp-design.md) | Why the agent speaks real MCP over stdio instead of importing `retrieve()`, and why the loop is bounded at 8 steps |
 | [ADR-004](docs/adr/ADR-004-cold-path-flink-iceberg.md) | Why there is no p95 in Flink, why Iceberg tables are created outside the SQL, and how resume avoids re-committing |
 | [ADR-005](docs/adr/ADR-005-hot-path-clickhouse-grafana.md) | Why the ClickHouse Kafka engine instead of Kafka Connect, and why every count uses `uniqExact(span_id)` |
+| [ADR-006](docs/adr/ADR-006-analytics-layer.md) | Why Trino shares Flink's catalog rather than opening a second one, why staging models are tables, and where the exact p95 finally lives |
+| [ADR-007](docs/adr/ADR-007-cdc-metadata.md) | Why CDC instead of dual-writing, why the changelog lands through a batch pull rather than a third Flink job, and what a replication slot retains while nobody is reading it |
 
 ## Status and roadmap
 
 Built and verified: the telemetry SDK, the inference gateway, the RAG corpus and hybrid
 retrieval, the MCP server and the bounded agent loop, the Flink to Iceberg cold path,
-the ClickHouse and Grafana hot path, and CI (lint, tests, and a schema-compatibility
-gate that runs when `contracts/` changes).
+the ClickHouse and Grafana hot path, the Trino/dbt/Great Expectations analytics layer
+with OpenLineage lineage, Debezium CDC from a Postgres metadata database, and CI (lint,
+tests, a schema-compatibility gate that runs when `contracts/` changes, and a quality
+gate that runs the analytics slice for real).
 
 Next:
 
-- **dbt marts on Trino** over the Iceberg tables — curated models with tests, replacing
-  the single hand-written 5-minute aggregate.
-- **Debezium CDC** so application state lands on the same topic contract as telemetry.
-- **An eval harness with quality gates in CI** — the two panels in
-  `dashboards/json/quality.json` are wired to the store and deliberately marked "not
-  measured yet"; that is the gap this closes.
+- **An eval harness with quality gates in CI.** The metadata tables it writes —
+  `prompt_versions`, `golden_examples`, `eval_runs`, `eval_results` — exist and are
+  already streaming into the lake ([ADR-007](docs/adr/ADR-007-cdc-metadata.md)); the
+  harness that fills them is the gap.
+- **Landing the other three CDC topics.** The connector captures all four metadata
+  tables, but only `prompt_versions` is landed and modelled — the rest is a copy of
+  `scripts/cdc_land.py`, not a design.
 - **Terraform** for the deployed footprint.
 
-The empty `dbt/`, `eval/` and `infra/` directories are placeholders for exactly these.
+The empty `eval/` and `infra/` directories are placeholders for exactly these.
 
 ## Running it on a small machine
 
 The whole thing is developed on an 8 GB laptop with WSL capped at 4 GB. Every service
 carries an explicit `mem_limit`, and `docker-compose.yml` is sliced into profiles so
-only one heavy piece runs at a time: the Kafka spine alone, plus `rag`, `streaming` or
-`hotpath`. The measured footprints are in ADR-004 and ADR-005, alongside the JVM sizing
-that a 4 GB ceiling forces on Flink.
+only one heavy piece runs at a time: the Kafka spine alone, plus `rag`, `streaming`,
+`hotpath`, `analytics` or `cdc`. The measured footprints are in ADR-004, ADR-005,
+ADR-006 and ADR-007, alongside the JVM sizing that a 4 GB ceiling forces on Flink,
+Trino and Kafka Connect. That ceiling is also an argument in the designs, not just a
+constraint on them: it is why CDC lands through a batch pull rather than a third
+long-running Flink job (ADR-007 §3).
 
 ## License
 
