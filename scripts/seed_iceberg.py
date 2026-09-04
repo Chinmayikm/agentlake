@@ -58,6 +58,12 @@ BAD_SPAN_ID = "00000000000000000000000000000bad"
 
 MODELS = ("claude-haiku-4-5", "claude-sonnet-5")
 
+#: The prompt versions LLM_CALL spans are attributed to. These MUST be a subset
+#: of what scripts/cdc_land.py's `seed` subcommand writes into the CDC
+#: changelog, because together they are what makes CI exercise
+#: fct_cost_by_prompt's join rather than just its aggregation.
+PROMPT_VERSIONS = ("v1", "v2", "v3")
+
 # Same shapes scripts/gen_traffic.py emits, because the point of a fixture is to
 # look like production. An ok turn is AGENT_STEP + RETRIEVAL + LLM_CALL; an
 # error turn is AGENT_STEP + TOOL_CALL, both status='error', the TOOL_CALL
@@ -185,7 +191,19 @@ def build_rows(events: int, sessions: int, error_rate: float, base: datetime) ->
                 latency_ms=random.uniform(2.0, 30.0),
                 cost_usd=round(prompt_tokens * 1e-6 + completion_tokens * 5e-6, 6),
                 status="ok", ts=ts,
-                attributes={"name": "chat_completion", "finish_reason": "stop"},
+                attributes={
+                    "name": "chat_completion",
+                    "finish_reason": "stop",
+                    # The join key of lake.analytics.fct_cost_by_prompt. Without
+                    # it CI's mart would be 100% prompt_attribution='unversioned'
+                    # -- every test would pass and the join, which is the entire
+                    # point of that mart, would never execute. Cycled across the
+                    # versions scripts/cdc_land.py seeds so all three attribution
+                    # states are covered: v1 is deleted in that changelog, v2 and
+                    # v3 are live, and the 'unversioned' group still exists
+                    # because error turns emit no LLM_CALL at all.
+                    "prompt_version": random.choice(PROMPT_VERSIONS),
+                },
             ))
 
     return rows[:events]

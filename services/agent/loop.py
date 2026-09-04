@@ -37,6 +37,22 @@ from services.sdk import session, span
 DEFAULT_MAX_STEPS = 8
 DEFAULT_TOOL_TIMEOUT = 15.0
 
+#: Which prompt template this agent is running. Stamped onto the AGENT_STEP span
+#: here, and sent to the gateway as X-Prompt-Version so it reaches the LLM_CALL
+#: span too -- which is the one that carries cost_usd and tokens, and therefore
+#: the only one the "cost per turn by prompt version" dashboards can divide.
+#: See ADR-007 #6.
+#:
+#: A constant, not a lookup: services/agent does not read the metadata database.
+#: The value has to MATCH a row in metadata/sql/07_seed.sql's prompt_versions
+#: (v3 is the seeded cited-and-tool-using template), and the check that it does
+#: lives downstream, in lake.analytics.fct_cost_by_prompt -- a version the
+#: dimension has never held shows up there as prompt_attribution='unknown'
+#: rather than as a crash here. That is deliberate: an agent that refused to run
+#: because a metadata row was missing would make the telemetry a dependency of
+#: the thing it observes.
+DEFAULT_PROMPT_VERSION = "v3"
+
 # Same schemas/descriptions the MCP server advertises via list_tools() --
 # one source of truth for what each tool does and accepts.
 TOOL_DEFS: list[dict[str, Any]] = [
@@ -83,8 +99,12 @@ async def run_turn(
     model_alias: str = "fast",
     max_steps: int = DEFAULT_MAX_STEPS,
     tool_timeout: float = DEFAULT_TOOL_TIMEOUT,
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
 ) -> AgentResult:
-    with session(session_id) as sid, span("AGENT_STEP", "agent_turn") as step:
+    with (
+        session(session_id) as sid,
+        span("AGENT_STEP", "agent_turn", prompt_version=prompt_version) as step,
+    ):
         messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
         tools_called: list[str] = []
         total_tokens = 0
@@ -98,6 +118,7 @@ async def run_turn(
             resp = await gateway.chat(
                 ChatRequest(messages=messages, model_alias=model_alias, tools=TOOL_DEFS),
                 session_id=sid,
+                prompt_version=prompt_version,
             )
             total_tokens += resp.usage.prompt_tokens + resp.usage.completion_tokens
             total_cost_usd += resp.usage.cost_usd
@@ -138,6 +159,7 @@ async def run_turn(
             resp = await gateway.chat(
                 ChatRequest(messages=messages, model_alias=model_alias, tools=None),
                 session_id=sid,
+                prompt_version=prompt_version,
             )
             total_tokens += resp.usage.prompt_tokens + resp.usage.completion_tokens
             total_cost_usd += resp.usage.cost_usd

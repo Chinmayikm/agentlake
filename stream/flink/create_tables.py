@@ -178,9 +178,17 @@ def create_table_request(
     }
 
 
-def _put(client: httpx.Client, path: str, body: dict[str, Any], what: str) -> bool:
+def create_if_absent(client: httpx.Client, path: str, body: dict[str, Any], what: str) -> bool:
     """POST `body` to `path`. Returns True if it created something, False if it
-    already existed. Anything else raises."""
+    already existed. Anything else raises.
+
+    Public, and imported by scripts/cdc_land.py, which creates
+    ``lake.cdc.prompt_versions`` through the same REST catalog (ADR-007 #3).
+    That table is not in ``TABLES`` below because this module is what creates
+    the tables the *Flink jobs* write into, and the CDC landing table is written
+    by the CDC lander -- but the two POSTs are identical, so they are written
+    once.
+    """
     response = client.post(path, json=body)
     if response.status_code == httpx.codes.CONFLICT:
         print(f"exists   {what}")
@@ -235,9 +243,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     print(f"dropped  {namespace}.{table}")
-            _put(client, "/v1/namespaces", {"namespace": [namespace], "properties": {}},
+            create_if_absent(client, "/v1/namespaces", {"namespace": [namespace], "properties": {}},
                  f"namespace {namespace}")
-            _put(client, f"/v1/namespaces/{namespace}/tables",
+            create_if_absent(client, f"/v1/namespaces/{namespace}/tables",
                  create_table_request(table, schema, spec), f"table {namespace}.{table}")
 
     print(f"\ncatalog {args.uri} ready: lake.raw.trace_events, lake.curated.agg_model_5m")

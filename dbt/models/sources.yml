@@ -32,6 +32,49 @@ sources:
           - name: ts_epoch_ms
           - name: attributes
 
+  # The Debezium changelog (ADR-007). Its own namespace, not lake.raw: ADR-006
+  # #1's rule is one writer per table and its ownership table reads "lake.raw --
+  # written by Flink". lake.cdc is written by scripts/cdc_land.py and by nothing
+  # else, which keeps that sentence true rather than adding a footnote to it.
+  #
+  # Unlike lake_raw, this column list is not contract-locked -- there is no
+  # .avsc behind it, because the CDC topics carry JSON rather than registry
+  # Avro (ADR-007 #2). It is checked against scripts/cdc_land.py's CDC_SCHEMA by
+  # tests/test_cdc.py instead, which is the same guarantee by a different route.
+  - name: lake_cdc
+    database: lake
+    schema: cdc
+    description: >
+      The Debezium changelog for public.prompt_versions, landed verbatim by
+      scripts/cdc_land.py -- one row per Kafka record, append-only and
+      at-least-once. NOT a state table: resolve it with stg_prompt_versions,
+      which takes the latest record per primary key. Reading this directly will
+      double-count every row that was ever updated.
+    tables:
+      - name: prompt_versions
+        description: >
+          One Iceberg row per Debezium record. Tombstones, TRUNCATE (op='t')
+          and logical-decoding messages (op='m') are counted by the lander and
+          not landed -- none carries a row image, and a delete is already fully
+          described by the op='d' record before its tombstone.
+        columns:
+          - name: op
+          - name: source_lsn
+          - name: source_tx_id
+          - name: source_snapshot
+          - name: source_ts
+          - name: event_ts
+          - name: ingest_ts
+          - name: kafka_partition
+          - name: kafka_offset
+          - name: id
+          - name: name
+          - name: version
+          - name: template_text
+          - name: params_json
+          - name: created_at
+          - name: envelope_json
+
   - name: lake_curated
     database: lake
     schema: curated

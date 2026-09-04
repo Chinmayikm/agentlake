@@ -6,9 +6,10 @@ written against docs/adr/ADR-003's spec, not the implementation.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
-from services.agent.loop import DEFAULT_MAX_STEPS, run_turn
+from services.agent.loop import DEFAULT_MAX_STEPS, DEFAULT_PROMPT_VERSION, run_turn
 from services.gateway.chat import ChatResponse, UsageOut
 from services.sdk import current_parent_span_id, current_trace_id
 
@@ -38,9 +39,21 @@ class FakeGateway:
     def __init__(self, responses: list[ChatResponse]) -> None:
         self._responses = list(responses)
         self.requests: list[Any] = []
+        # What the loop passed alongside each request. prompt_version travels as
+        # a header on the real client rather than in the body (ADR-007 #6), so
+        # recording it here is the only way an in-process test can see that the
+        # gateway would have been told.
+        self.prompt_versions: list[str | None] = []
 
-    async def chat(self, request, *, session_id: str | None = None):
+    async def chat(
+        self,
+        request,
+        *,
+        session_id: str | None = None,
+        prompt_version: str | None = None,
+    ):
         self.requests.append(request)
+        self.prompt_versions.append(prompt_version)
         if not self._responses:
             raise AssertionError("FakeGateway ran out of scripted responses")
         return self._responses.pop(0)
@@ -200,3 +213,82 @@ def test_span_tree_and_session_propagation(events) -> None:
 
     for event in events:
         assert event["session_id"] == "fixed-session"
+
+
+# ---------------------------------------------------------------------------
+# 5. prompt_version (ADR-007 #6)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_version_is_stamped_on_agent_step_and_sent_to_the_gateway(events) -> None:
+    """The one-attribute promise, both halves of it.
+
+    AGENT_STEP carries the version so a turn is self-describing. But AGENT_STEP
+    rows have NULL cost_usd and NULL tokens by contract, so a dashboard dividing
+    cost by turns would render zero from them alone -- the version has to reach
+    the LLM_CALL span, which lives in services/gateway. This process cannot
+    observe that span (the gateway is another process), so what is asserted here
+    is the half services/agent owns: that every outbound call carried the
+    version. tests/test_gateway.py asserts the other half.
+    """
+    gateway = FakeGateway(
+        [
+            _resp([_tool_use_block("tu1", "search_docs", {"query": "x"})], stop_reason="tool_use"),
+            _resp([_text_block("done")]),
+        ]
+    )
+
+    asyncio.run(
+        run_turn(
+            "q",
+            gateway=gateway,
+            tool_executor=FakeToolExecutor(),
+            session_id="s-pv",
+        )
+    )
+
+    agent_steps = [e for e in events if e["event_type"] == "AGENT_STEP"]
+    assert agent_steps[0]["attributes"]["prompt_version"] == DEFAULT_PROMPT_VERSION
+
+    # Every call, not just the first: the forced final call after budget
+    # exhaustion is a separate call site and has been forgotten before.
+    assert gateway.prompt_versions == [DEFAULT_PROMPT_VERSION, DEFAULT_PROMPT_VERSION]
+
+
+def test_prompt_version_is_overridable_and_reaches_every_call(events) -> None:
+    """--prompt-version is what lets one run be attributed to a new template
+    without a redeploy, which is how ADR-007's verification log gets a v4 row
+    into fct_cost_by_prompt."""
+    gateway = FakeGateway([_resp([_text_block("done")])])
+
+    asyncio.run(
+        run_turn(
+            "q",
+            gateway=gateway,
+            tool_executor=FakeToolExecutor(),
+            session_id="s-pv2",
+            prompt_version="v4",
+        )
+    )
+
+    agent_steps = [e for e in events if e["event_type"] == "AGENT_STEP"]
+    assert agent_steps[0]["attributes"]["prompt_version"] == "v4"
+    assert gateway.prompt_versions == ["v4"]
+
+
+def test_default_prompt_version_matches_the_seeded_metadata_row() -> None:
+    """DEFAULT_PROMPT_VERSION has to name a row metadata/sql/07_seed.sql
+    actually inserts, or every span the agent emits lands in
+    fct_cost_by_prompt as prompt_attribution='unknown' -- which is the state
+    that is supposed to mean the CDC lander has not run.
+
+    A file-level check on purpose: the agent deliberately does not read the
+    metadata database (see loop.py), so nothing at runtime would ever notice.
+    """
+    seed = (
+        Path(__file__).resolve().parents[1] / "metadata" / "sql" / "07_seed.sql"
+    ).read_text(encoding="utf-8")
+    assert f"'{DEFAULT_PROMPT_VERSION}'," in seed, (
+        f"DEFAULT_PROMPT_VERSION={DEFAULT_PROMPT_VERSION!r} is not seeded in "
+        "metadata/sql/07_seed.sql"
+    )

@@ -45,6 +45,19 @@ select
     -- Set by the SDK's own except-block (telemetry.py) from type(exc).__name__.
     element_at(attributes, 'error_class') as error_class,
 
+    -- The prompt template this LLM call was made under. services/gateway stamps
+    -- it onto the LLM_CALL span from the X-Prompt-Version header the agent
+    -- sends (ADR-007 #6); services/agent stamps it onto AGENT_STEP too, so a
+    -- turn is self-describing. NULL on every other span type, and on every span
+    -- older than that change -- which fct_cost_by_prompt reports as
+    -- prompt_attribution='unversioned' rather than dropping.
+    --
+    -- Unpacked here rather than left as element_at(...) in the mart, for the
+    -- reason at the top of this file: a mart that spells out the map lookup is
+    -- a mart that will spell it differently the second time. This is the join
+    -- key to stg_prompt_versions.version.
+    element_at(attributes, 'prompt_version') as prompt_version,
+
     -- status != 'ok', never status = 'error'. status is a free-form contract
     -- string and the SDK promotes whatever set(status=...) is handed it -- its
     -- own tests already cover "degraded" -- so equality against 'error' would

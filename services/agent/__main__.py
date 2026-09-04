@@ -1,4 +1,4 @@
-"""`python -m services.agent "question" [--session ID] [--quality]`"""
+"""`python -m services.agent "question" [--session ID] [--quality] [--prompt-version V]`"""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ import sys
 import uuid
 
 from services.agent.gateway_client import GatewayUnavailableError, HttpGatewayClient
-from services.agent.loop import DEFAULT_MAX_STEPS, DEFAULT_TOOL_TIMEOUT, run_turn
+from services.agent.loop import (
+    DEFAULT_MAX_STEPS,
+    DEFAULT_PROMPT_VERSION,
+    DEFAULT_TOOL_TIMEOUT,
+    run_turn,
+)
 from services.agent.mcp_client import StdioToolExecutor
 
 
@@ -23,6 +28,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--tool-timeout", type=float, default=DEFAULT_TOOL_TIMEOUT)
+    parser.add_argument(
+        "--prompt-version",
+        default=DEFAULT_PROMPT_VERSION,
+        help="the prompt template version to attribute this turn to; it is "
+        "stamped on the AGENT_STEP span and sent to the gateway as "
+        "X-Prompt-Version so it reaches the LLM_CALL span too "
+        "(default: %(default)s, matching metadata/sql/07_seed.sql)",
+    )
     return parser
 
 
@@ -45,6 +58,7 @@ async def _main(argv: list[str] | None = None) -> int:
                 model_alias="quality" if args.quality else "fast",
                 max_steps=args.max_steps,
                 tool_timeout=args.tool_timeout,
+                prompt_version=args.prompt_version,
             )
     except GatewayUnavailableError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -56,7 +70,7 @@ async def _main(argv: list[str] | None = None) -> int:
     print(
         f"[{result.steps_used} steps, tools: {result.tools_called}, "
         f"{result.total_tokens} tok, ${result.total_cost_usd:.4f}, "
-        f"trace {result.trace_id}]"
+        f"prompt {args.prompt_version}, trace {result.trace_id}]"
     )
     return 0
 

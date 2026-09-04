@@ -126,8 +126,41 @@ def cmd_counts(client: TrinoClient, args: argparse.Namespace) -> int:
                (SELECT count(*) FROM {CATALOG}.analytics.stg_trace_events
                 WHERE event_type = 'TOOL_CALL')
         FROM {CATALOG}.analytics.fct_tool_reliability
+        UNION ALL
+        SELECT 'fct_cost_by_prompt', count(*), sum(calls),
+               (SELECT count(*) FROM {CATALOG}.analytics.stg_trace_events
+                WHERE event_type = 'LLM_CALL')
+        FROM {CATALOG}.analytics.fct_cost_by_prompt
         """,
         "marts vs staging",
+    )
+
+    # The CDC half (ADR-007). Printed unconditionally rather than behind a flag:
+    # an all-'unversioned' mart is the normal state of a warehouse whose traffic
+    # predates the gateway stamping prompt_version, and an all-'unknown' one
+    # means scripts/cdc_land.py has not run -- two very different situations
+    # that look identical if you only count rows.
+    _show(
+        client,
+        f"""
+        SELECT prompt_attribution, count(*) AS mart_rows, sum(calls) AS llm_calls,
+               sum(turns) AS turns, round(sum(cost_usd), 6) AS cost_usd
+        FROM {CATALOG}.analytics.fct_cost_by_prompt
+        GROUP BY prompt_attribution ORDER BY prompt_attribution
+        """,
+        "fct_cost_by_prompt by attribution",
+    )
+
+    _show(
+        client,
+        f"""
+        SELECT
+            (SELECT count(*) FROM {CATALOG}.cdc.prompt_versions)          AS changelog_rows,
+            (SELECT count(*) FROM {CATALOG}.analytics.stg_prompt_versions) AS dimension_rows,
+            (SELECT count(*) FROM {CATALOG}.analytics.stg_prompt_versions
+              WHERE is_deleted)                                            AS deleted_rows
+        """,
+        "cdc changelog vs resolved dimension",
     )
 
     total = client.execute(

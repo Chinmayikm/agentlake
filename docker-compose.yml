@@ -7,9 +7,15 @@
 #                                             flink jm/tm -- see ADR-004)
 #   docker compose --profile hotpath up -d    + the hot path  (clickhouse, grafana
 #                                             -- see ADR-005)
+#   docker compose --profile cdc up -d        + the metadata DB and Debezium
+#                                             (metadata-db, metadata-init, connect
+#                                             -- see ADR-007)
 #
 # streaming and hotpath are meant to be run one at a time, not together: each is
-# sized to fit alongside the spine, not alongside each other. They do not fight
+# sized to fit alongside the spine, not alongside each other. cdc is the
+# exception and is meant to sit beside ONE of them -- it is ~535 MiB, and its
+# capture half and its landing half do not even have to run at the same time,
+# because Kafka holds the topic in between (ADR-007 #3). They do not fight
 # over host ports (clickhouse publishes 8123 only, precisely so minio can keep
 # 9000), so running both is a memory decision rather than an error.
 #
@@ -569,6 +575,150 @@ services:
       WEB_PORT: "3000"
     mem_limit: 128m
 
+  # --- cdc (ADR-007): Postgres -> Debezium -> Kafka ---------------------------
+  #
+  # The metadata database and the connector that streams its WAL onto Kafka.
+  # Unlike the analytics slice, this one is nothing without a broker, so a bare
+  # `docker compose --profile cdc up -d` starting kafka and schema-registry too
+  # is exactly right rather than a waste -- which is why `make cdc-up` does not
+  # name its services the way `make analytics-up` has to.
+  #
+  # Measured together: metadata-db + connect fit beside the spine, and beside
+  # ONE of streaming/hotpath/analytics. Not beside two. See CLAUDE.md.
+
+  metadata-db:
+    image: postgres:16.10-alpine
+    container_name: agentlake-metadata-db
+    profiles: [cdc]
+    # wal_level=logical from the start, not ALTERed in afterwards. It is a
+    # postmaster-level setting that needs a restart to take effect, and a
+    # replication slot created while the WAL is still at `replica` is a slot
+    # that connects, reports healthy and never yields a single row.
+    #
+    # max_replication_slots/max_wal_senders default to 10 in PG16, so these are
+    # not raising a ceiling -- they are lowering it to something a 256m
+    # container can actually back, and putting the number next to the thing
+    # that consumes it.
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    # Host 5433: marquez-db has no published port, but 5432 is the first port
+    # any local Postgres grabs, and this one is meant to be poked at by hand
+    # (`make cdc-psql`). Same instinct as leaving 8080 free.
+    ports: ["5433:5432"]
+    environment:
+      POSTGRES_USER: ${METADATA_DB_USER:-agentlake}
+      POSTGRES_PASSWORD: ${METADATA_DB_PASSWORD:-agentlake-dev-secret}
+      POSTGRES_DB: agentlake
+    mem_limit: 256m
+    volumes:
+      - metadata_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${METADATA_DB_USER:-agentlake} -d agentlake"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot: apply metadata/sql/*.sql in filename order, then exit. Exactly the
+  # minio-init pattern, and for the same reason -- `connect` waits on
+  # service_completed_successfully, so "Postgres is up" and "the schema, the
+  # role and the publication exist" stay two separate observable facts rather
+  # than one hopeful sleep.
+  #
+  # Every file is written to be safe to re-apply (CREATE ... IF NOT EXISTS,
+  # DO-block guards, ON CONFLICT DO NOTHING), because this runs on every
+  # bring-up. Idempotency lives in the SQL, not in a ledger table: there is no
+  # migration framework here, deliberately, for the same reason there is no
+  # pyiceberg (ADR-004 #2) -- psql is already in the image.
+  metadata-init:
+    image: postgres:16.10-alpine
+    container_name: agentlake-metadata-init
+    profiles: [cdc]
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${METADATA_DB_PASSWORD:-agentlake-dev-secret}
+      POSTGRES_USER: ${METADATA_DB_USER:-agentlake}
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:-debezium-dev-secret}
+    # -v ON_ERROR_STOP=1 so a failing statement fails the container rather than
+    # printing an error and exiting 0, which is psql's default and is how a
+    # half-applied schema gets mistaken for a working one.
+    #
+    # Every line below sits at the SAME indentation on purpose: `>` folds
+    # equally-indented lines into spaces but keeps a more-indented line's
+    # newline literally, which would split the psql invocation in half.
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      for f in /sql/*.sql; do
+      echo \"applying $$(basename $$f)\";
+      psql -v ON_ERROR_STOP=1 -v dbz_password=\"$$DEBEZIUM_PASSWORD\" -h metadata-db -U $$POSTGRES_USER -d agentlake -f $$f;
+      done;
+      echo 'metadata schema ready';
+      "
+    mem_limit: 64m
+    volumes:
+      - ./metadata/sql:/sql:ro
+
+  connect:
+    # Debezium 3.0 is built against Kafka Connect 3.8.0 and tested against 3.8.0
+    # brokers -- which is exactly the apache/kafka:3.8.0 above. 3.0.8.Final is
+    # the newest tag on that line. Later Debezium lines target later Kafka, and
+    # matching the broker is the same argument ADR-004 #1 makes for Flink: pin
+    # the thing that is already fixed, then let everything else follow from it.
+    image: quay.io/debezium/connect:3.0.8.Final
+    container_name: agentlake-connect
+    profiles: [cdc]
+    depends_on:
+      kafka:
+        condition: service_started
+      metadata-init:
+        condition: service_completed_successfully
+    ports: ["8083:8083"]   # Connect's REST API -- 8083 is unclaimed here
+    environment:
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: agentlake-connect
+      CONFIG_STORAGE_TOPIC: connect.configs
+      OFFSET_STORAGE_TOPIC: connect.offsets
+      STATUS_STORAGE_TOPIC: connect.status
+      # One broker. These default to 3, and Connect does not degrade -- it
+      # fails to create its own internal topics and never finishes starting.
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      # JSON, not Avro, and that is forced rather than preferred: the Debezium
+      # image does not ship Confluent's Avro converter (Confluent Community
+      # License), so registry-backed Avro here means building and pinning a
+      # second image. schemas.enable=false because the schema-carrying form
+      # wraps every field in a payload/schema envelope that triples the record
+      # size and tells scripts/cdc_land.py nothing it does not already know.
+      # Consequence, stated in ADR-007 #2: unlike traces.events.v1, the CDC
+      # topics are not registry-enforced.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      # A JVM under a cgroup states its heap here, the same argument ADR-004 #8
+      # makes for Flink and kafka-ui. Connect's own default is 1g, which a 640m
+      # limit turns into an OOM kill under snapshot load rather than
+      # backpressure. The rest of the 640m is metaspace, code cache and the
+      # per-task thread stacks.
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx384m
+      JAVA_OPTS: -XX:MaxMetaspaceSize=128m
+    mem_limit: 640m
+    healthcheck:
+      # Connect answers /connectors only once the REST layer and the plugin
+      # scan are both done, which is ~25s -- `up -d` followed immediately by
+      # register_connector.py is otherwise a race.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/connectors"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+
   # --- tools (on demand): a browser onto the topic itself ---------------------
 
   kafka-ui:
@@ -614,3 +764,4 @@ volumes:
   clickhouse_data:
   grafana_data:
   marquez_db:
+  metadata_db:

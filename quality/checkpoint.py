@@ -1,4 +1,4 @@
-"""The Great Expectations gate over the three marts.
+"""The Great Expectations gate over the marts.
 
     make quality
 
@@ -76,8 +76,15 @@ BLOCK = {"severity": "blocking"}
 #: traffic this week", not "is the pipeline down".
 FRESHNESS_HOURS = float(os.environ.get("AGENTLAKE_FRESHNESS_HOURS", "168"))
 
-#: The three marts, and every expectation over them.
-MARTS = ("fct_sessions", "fct_model_costs", "fct_tool_reliability")
+#: The marts, and every expectation over them. build_suites() asserts that it
+#: produces exactly these, in this order -- without that this constant is a
+#: comment that can silently disagree with the code below it.
+MARTS = (
+    "fct_sessions",
+    "fct_model_costs",
+    "fct_tool_reliability",
+    "fct_cost_by_prompt",
+)
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,7 @@ def freshness_floor() -> dt.datetime:
 
 def build_suites() -> list[MartSuite]:
     """Every expectation, in one place, so the gate can be read as a list."""
-    return [
+    suites = [
         MartSuite(
             table="fct_sessions",
             expectations=[
@@ -171,7 +178,50 @@ def build_suites() -> list[MartSuite]:
                 ),
             ],
         ),
+        MartSuite(
+            table="fct_cost_by_prompt",
+            expectations=[
+                # --- blocking ---
+                gxe.ExpectTableRowCountToBeBetween(min_value=1, meta=BLOCK),
+                gxe.ExpectColumnValuesToNotBeNull(column="event_day", meta=BLOCK),
+                gxe.ExpectColumnValuesToBeBetween(column="calls", min_value=1, meta=BLOCK),
+                gxe.ExpectColumnValuesToBeBetween(column="turns", min_value=1, meta=BLOCK),
+                gxe.ExpectColumnValuesToBeBetween(column="cost_usd", min_value=0, meta=BLOCK),
+                gxe.ExpectColumnValuesToBeBetween(column="total_tokens", min_value=0, meta=BLOCK),
+                # A CASE with exactly three arms produced this column, so a
+                # fourth value is the model having changed, not the data.
+                gxe.ExpectColumnValuesToBeInSet(
+                    column="prompt_attribution",
+                    value_set=["known", "unversioned", "unknown"],
+                    meta=BLOCK,
+                ),
+                # turns is count(distinct trace_id) over the very rows calls
+                # counts, so this is arithmetic rather than a hope.
+                gxe.ExpectColumnPairValuesAToBeGreaterThanB(
+                    column_A="calls", column_B="turns", or_equal=True, meta=BLOCK
+                ),
+                # --- warn ---
+                # A span naming a prompt version the dimension does not hold is
+                # news, not a broken build: it is the normal state between a row
+                # being created in Postgres and `make cdc-land` next running.
+                # "Depends on when it last ran" is ADR-006 #6's WARN half
+                # verbatim -- the same argument freshness gets. NOT a threshold
+                # on how many rows are 'unversioned', either: that share only
+                # falls as new traffic arrives after the gateway change, so
+                # gating on it would measure how recently someone ran traffic.
+                gxe.ExpectColumnValuesToNotBeInSet(
+                    column="prompt_attribution", value_set=["unknown"], meta=WARN
+                ),
+            ],
+        ),
     ]
+    # MARTS is a documentation constant and this is what stops it becoming a
+    # stale one: a mart added below and not added there (or vice versa) fails
+    # here, at the top of the gate, rather than being noticed by nobody.
+    covered = tuple(suite.table for suite in suites)
+    if covered != MARTS:
+        raise RuntimeError(f"build_suites() covers {covered}, but MARTS says {MARTS}")
+    return suites
 
 
 def _severity(config: dict[str, Any]) -> str:
