@@ -1,4 +1,5 @@
 .PHONY: test lint gateway traces rag-preflight prompts-load prompts-load-dry \
+        eval-validate eval-corpus-paths eval-ab \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -12,7 +13,7 @@
 # The path list here and the one in .github/workflows/ci.yml's ruff step are
 # asserted identical by tests/test_repo_hygiene.py -- "CI matches local
 # reality" only holds if the two cannot drift.
-LINT_PATHS = services/ tests/ stream/ scripts/ analytics/ quality/ metadata/
+LINT_PATHS = services/ tests/ stream/ scripts/ analytics/ quality/ metadata/ eval/
 
 test:
 	.venv/bin/python3 -m pytest -q
@@ -44,6 +45,26 @@ prompts-load:
 
 prompts-load-dry:
 	.venv/bin/python3 scripts/load_prompts.py --dry-run
+
+# Load and validate the golden set: closed-vocabulary tags, a stratified CI
+# subset of exactly 25, and -- the one that matters -- every expected_source
+# and written_from resolving to a real corpus document. An unresolvable prefix
+# scores hit@k = 0 forever and reads as a retrieval regression rather than as
+# the typo it is. Free, no services needed.
+eval-validate:
+	.venv/bin/python3 -m eval validate
+
+# Regenerate eval/golden/corpus_paths.txt from the live corpus. Needs qdrant.
+# Committed so eval-validate and the test suite need no Qdrant.
+eval-corpus-paths:
+	.venv/bin/python3 -m eval corpus-paths
+
+# Retrieval-only A/B across dense/bm25/hybrid over the WHOLE golden set.
+# Needs qdrant and nothing else -- no gateway, no Kafka, no API key, NO COST.
+# `--corpus-version unknown` reproduces the pre-ADR-008 bug exactly, which is
+# how docs/eval/retrieval_ab.md's before/after pair is measured.
+eval-ab:
+	.venv/bin/python3 -m eval ab --out docs/eval/retrieval_ab.md
 
 # --- cold path: Kafka -> Flink SQL -> Iceberg (ADR-004) ---------------------
 #

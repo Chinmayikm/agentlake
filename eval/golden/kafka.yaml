@@ -1,0 +1,379 @@
+# Golden examples for the pinned Kafka 3.8 corpus.
+#
+# Pinned documents (services/rag/sources.yaml): docs/design.html,
+# docs/configuration.html, docs/ops.html. Note that configuration.html is a
+# thin 9-chunk page -- Kafka's real config reference is generated tables that
+# do not survive chunking -- so config questions are sourced from design.html
+# and ops.html, which quote the settings in prose.
+#
+# AUTHORING RULE (ADR-008): every question here was written FROM the source
+# file named in `written_from`, and only then was retrieval run. Questions
+# written from retrieval results are biased toward being retrievable and
+# inflate hit@k by construction. `written_from` is recorded per example so the
+# rule is auditable rather than merely claimed.
+
+dataset_version: v1
+project: kafka
+
+examples:
+  # --- delivery semantics --------------------------------------------------
+  - key: kafka-delivery-001
+    question: "Does Kafka give me exactly-once delivery out of the box, or do I have to do something to get it?"
+    expected_answer: >
+      No. Kafka guarantees at-least-once delivery by default. Exactly-once is
+      available for Kafka-to-Kafka processing via the idempotent and
+      transactional producer (writing the consumer's offsets in the same
+      transaction as the output), and at-most-once can be had by disabling
+      producer retries and committing offsets before processing.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.6 Message Delivery Semantics"
+    difficulty: medium
+    type: conceptual
+    ci: true
+
+  - key: kafka-delivery-002
+    question: "What difference does the read_committed isolation level make to what a consumer sees?"
+    expected_answer: >
+      Under the default read_uncommitted, a consumer sees all messages
+      including ones written by transactions that were later aborted. Under
+      read_committed it only sees messages from committed transactions, plus
+      any messages that were never part of a transaction.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.6 Message Delivery Semantics"
+    difficulty: medium
+    type: factual
+
+  - key: kafka-delivery-003
+    question: "How does the idempotent producer stop a retried send from creating a duplicate?"
+    expected_answer: >
+      The broker assigns each producer an ID, and the producer sends a sequence
+      number with every message. The broker deduplicates using that
+      (producer ID, sequence number) pair, so resending a message that was in
+      fact already committed does not write a second copy to the log.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.6 Message Delivery Semantics"
+    difficulty: hard
+    type: factual
+    ci: true
+
+  # --- log compaction ------------------------------------------------------
+  - key: kafka-compaction-001
+    question: "If log compaction removes a message, do the offsets after it shift?"
+    expected_answer: >
+      No. Offsets never change -- an offset is the permanent identifier for a
+      position in the log. A compacted-away offset remains a valid position to
+      read from; a read starting there simply returns the next message that is
+      still present. Compaction also never reorders messages.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics"
+    difficulty: medium
+    type: conceptual
+
+  - key: kafka-compaction-002
+    question: "How do I delete a key from a compacted topic?"
+    expected_answer: >
+      Produce a message with that key and a null payload. Kafka treats a
+      null-payload record as a tombstone, which marks the key as deleted from
+      the log.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics"
+    difficulty: easy
+    type: factual
+    ci: true
+
+  - key: kafka-compaction-003
+    question: "Which setting turns log compaction on for a topic instead of time-based deletion?"
+    expected_answer: >
+      log.cleanup.policy=compact (set in server.properties as a default, or
+      per-topic as the cleanup.policy topic config).
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.8 Log Compaction > Configuring The Log Cleaner"
+    difficulty: easy
+    type: config
+    ci: true
+
+  - key: kafka-compaction-004
+    question: "I need every record to stay readable for at least an hour before compaction can touch it. Which config does that?"
+    expected_answer: >
+      min.compaction.lag.ms. It sets a lower bound on how long a message stays
+      in the uncompacted head of the log after being written. The counterpart,
+      max.compaction.lag.ms, bounds the maximum delay before a message becomes
+      eligible for compaction.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.8 Log Compaction > What guarantees does log compaction provide?"
+    difficulty: medium
+    type: config
+
+  - key: kafka-compaction-005
+    question: "How does the log cleaner decide which log to compact next, and how much memory does its index need?"
+    expected_answer: >
+      It picks the log with the highest ratio of log head to log tail. It then
+      builds a compact hash table summarising the last offset for each key in
+      the head, using about 24 bytes per entry -- so an 8 GB cleaner buffer can
+      clean roughly 366 GB of log head at 1 KB messages.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Details"
+    difficulty: hard
+    type: factual
+
+  # --- replication and durability -----------------------------------------
+  - key: kafka-replication-001
+    question: "What happens if every replica of a partition dies?"
+    expected_answer: >
+      Kafka must choose between two behaviours: wait for a replica that was in
+      the ISR to come back (staying unavailable, possibly permanently if that
+      data is gone), or let the first replica that returns become leader even
+      if it was not in sync, which makes its log the source of truth and can
+      lose committed messages. It is a straight availability-versus-consistency
+      tradeoff, controlled by unclean leader election.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.7 Replication > Unclean leader election: What if they all die?"
+    difficulty: medium
+    type: conceptual
+
+  - key: kafka-replication-002
+    question: "What does setting a minimum ISR size actually protect me from, and does the producer need to do anything?"
+    expected_answer: >
+      It stops the partition accepting writes unless at least that many
+      replicas are in sync, which prevents losing a message that was written to
+      only one replica that then disappeared. It only takes effect when the
+      producer uses acks=all; a higher minimum means better consistency at the
+      cost of availability.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.7 Replication > Availability and Durability Guarantees"
+    difficulty: medium
+    type: config
+    ci: true
+
+  - key: kafka-replication-003
+    question: "When a broker dies, who picks the new partition leaders?"
+    expected_answer: >
+      The controller. It manages broker registration, detects the failure, and
+      elects a new leader from the remaining in-sync replicas -- batching the
+      leadership changes together so an election for many partitions is far
+      cheaper than one election per partition. If the controller itself fails,
+      another controller is elected.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.7 Replication > Replica Management"
+    difficulty: medium
+    type: conceptual
+
+  # --- design rationale ----------------------------------------------------
+  - key: kafka-design-001
+    question: "Why does Kafka use an append-only log instead of a BTree like most messaging systems?"
+    expected_answer: >
+      BTree operations are O(log N), which is not effectively constant on disk:
+      a seek costs about 10 ms and a disk can only do one at a time, so a
+      handful of seeks dominates. An append-only structure turns the workload
+      into sequential I/O and avoids that cost.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.2 Persistence > Constant Time Suffices"
+    difficulty: medium
+    type: conceptual
+
+  - key: kafka-design-002
+    question: "Why do Kafka consumers pull from the broker rather than the broker pushing to them?"
+    expected_answer: >
+      A push-based broker controls the transfer rate and so struggles with
+      consumers of differing speeds -- a slow consumer gets overwhelmed when
+      production outruns consumption. Pulling lets each consumer draw at its
+      own maximum rate and catch up after falling behind.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.5 The Consumer > Push vs. pull"
+    difficulty: easy
+    type: conceptual
+    ci: true
+
+  - key: kafka-design-003
+    question: "Why is compression applied to a batch of messages rather than to each message individually?"
+    expected_answer: >
+      Most of the redundancy is between messages of the same type -- repeated
+      JSON field names, user agents, common string values -- so compressing
+      messages one at a time gives poor ratios. Kafka groups a batch, compresses
+      it together and sends it in that form; the broker decompresses it only to
+      validate it.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.3 Efficiency > End-to-end Batch Compression"
+    difficulty: medium
+    type: conceptual
+
+  - key: kafka-design-004
+    question: "How does a producer know which broker to send a record to, and how is the partition chosen?"
+    expected_answer: >
+      The producer sends directly to the partition leader with no routing tier;
+      any Kafka node can answer a metadata request saying which brokers are
+      alive and which holds each partition's leader. The client picks the
+      partition -- randomly, or by hashing a supplied key so all records for
+      that key land on one partition, or with a custom partitioner.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.4 The Producer > Load balancing"
+    difficulty: easy
+    type: conceptual
+
+  - key: kafka-design-005
+    question: "Why does the consumer track its own offset instead of the broker recording what was consumed?"
+    expected_answer: >
+      If the broker marks a message consumed the moment it hands it out, a
+      consumer that fails before processing loses it; if it waits for an
+      acknowledgement, broker and consumer have to agree on what was consumed,
+      which is not a trivial problem. Kafka avoids it by letting the consumer
+      control its position in the log.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.5 The Consumer > Consumer Position"
+    difficulty: medium
+    type: conceptual
+
+  # --- quotas --------------------------------------------------------------
+  - key: kafka-quota-001
+    question: "What problem do Kafka quotas solve?"
+    expected_answer: >
+      They stop a client producing or consuming at a volume or request rate
+      that monopolises broker resources, saturates the network and effectively
+      denies service to everyone else -- which matters most on multi-tenant
+      clusters, where a few badly behaved clients can degrade everybody's
+      experience.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.9 Quotas > Why are quotas necessary?"
+    difficulty: easy
+    type: conceptual
+
+  - key: kafka-quota-002
+    question: "A request rate quota is expressed as a percentage — a percentage of what?"
+    expected_answer: >
+      Of time on one request handler I/O or network thread within a quota
+      window: n% means n% of a single thread, out of a total capacity of
+      ((num.io.threads + num.network.threads) * 100)%. Since those thread counts
+      usually track the broker's cores, it is effectively a share of broker CPU.
+    expected_sources: [docs/design.html]
+    written_from: "docs/design.html#4.9 Quotas > Request Rate Quotas"
+    difficulty: hard
+    type: config
+    ci: true
+
+  # --- operations ----------------------------------------------------------
+  - key: kafka-ops-001
+    question: "What does enabling controlled shutdown actually do for me when I restart a broker?"
+    expected_answer: >
+      With controlled.shutdown.enable=true the broker syncs its logs to disk so
+      it does not have to run log recovery on restart, and migrates the
+      partitions it leads to other replicas before stopping -- so each
+      partition is unavailable for milliseconds rather than for the length of a
+      leader election.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.1 Basic Kafka Operations > Graceful shutdown"
+    difficulty: medium
+    type: config
+
+  - key: kafka-ops-002
+    question: "After a rolling restart all my partition leaders ended up on a couple of brokers. How do I spread them back out?"
+    expected_answer: >
+      Kafka considers the first broker in a partition's replica list its
+      preferred leader and by default tries to restore leadership there, via
+      auto.leader.rebalance.enable=true. It can also be triggered manually with
+      kafka-leader-election.sh --election-type preferred --all-topic-partitions.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.1 Basic Kafka Operations > Balancing leadership"
+    difficulty: medium
+    type: config
+
+  - key: kafka-ops-003
+    question: "Should I configure Kafka to fsync every message to disk?"
+    expected_answer: >
+      No -- the recommendation is to keep the default, which disables
+      application-level fsync entirely and relies on the OS background flush
+      plus Kafka's own. Durability comes from replication rather than from
+      syncing to disk, since a failed node recovers from its replicas, and on
+      crash recovery Kafka validates each message's CRC and rebuilds the offset
+      index anyway.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.7 Hardware and OS > Application vs. OS Flush Management"
+    difficulty: medium
+    type: config
+
+  - key: kafka-ops-004
+    question: "EXT4 or XFS for Kafka's log directories?"
+    expected_answer: >
+      XFS. Both are widely used and Kafka has no hard filesystem dependency,
+      but comparison testing under significant load showed XFS with much better
+      request local times (about 160 ms against 250 ms+ for the best EXT4
+      configuration) and lower average wait times, with no loss of stability.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.7 Hardware and OS > Filesystem Selection"
+    difficulty: easy
+    type: factual
+
+  - key: kafka-ops-005
+    question: "How do I see how far behind a consumer group is?"
+    expected_answer: >
+      kafka-consumer-groups.sh --bootstrap-server <host:port> --describe
+      --group <group>. It prints CURRENT-OFFSET, LOG-END-OFFSET and LAG per
+      topic partition, along with the consumer instance owning each one.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.1 Basic Kafka Operations > Checking consumer position"
+    difficulty: easy
+    type: factual
+
+  - key: kafka-ops-006
+    question: "How do I increase the replication factor of an existing topic?"
+    expected_answer: >
+      There is no direct flag -- you write a reassignment plan in JSON naming
+      the full replica list you want for each partition, then apply it with
+      kafka-reassign-partitions.sh --reassignment-json-file <file> --execute.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.1 Basic Kafka Operations > Increasing replication factor"
+    difficulty: medium
+    type: factual
+
+  - key: kafka-ops-007
+    question: "A partition reassignment is saturating my inter-broker network. Can I slow it down without cancelling it?"
+    expected_answer: >
+      Yes. Pass --throttle <bytes/sec> to kafka-reassign-partitions.sh to cap
+      the inter-broker rate, and change it mid-reassignment by re-running the
+      execute command with --additional and the same reassignment JSON file.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.1 Basic Kafka Operations > Limiting Bandwidth Usage during Data Migration"
+    difficulty: hard
+    type: factual
+
+  - key: kafka-ops-008
+    question: "Why does KRaft make me run kafka-storage.sh format instead of formatting empty log directories itself?"
+    expected_answer: >
+      Because auto-formatting can hide an error. That matters most for the
+      controller and broker metadata log: if a majority of controllers were
+      allowed to start from an empty log directory, a leader could be elected
+      that is missing committed data.
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.10 KRaft > Storage Tool"
+    difficulty: hard
+    type: conceptual
+    ci: true
+
+  - key: kafka-ops-009
+    question: "Can I use Kafka tiered storage in production in 3.8?"
+    expected_answer: >
+      No -- in this release tiered storage is an early-access feature and is
+      explicitly not recommended for production use. It splits storage into a
+      local tier on broker disks and a remote tier such as HDFS or S3 for
+      completed log segments (KIP-405).
+    expected_sources: [docs/ops.html]
+    written_from: "docs/ops.html#6.11 Tiered Storage > Tiered Storage Overview"
+    difficulty: medium
+    type: factual
+
+  # --- deliberately unanswerable ------------------------------------------
+  # The pinned corpus is design.html / configuration.html / ops.html. Strimzi
+  # is a third-party Kubernetes operator and appears in none of them. v4's
+  # prompt says to "say plainly when the corpus does not answer the question
+  # rather than filling the gap"; v5 removes that sentence. This is the example
+  # that tells them apart.
+  - key: kafka-unanswerable-001
+    question: "How do I configure a Kafka cluster with the Strimzi Kubernetes operator?"
+    expected_answer: >
+      The pinned corpus does not cover this. It contains Kafka's own design,
+      configuration and operations documentation, which says nothing about
+      Strimzi or any third-party Kubernetes operator.
+    expected_sources: []
+    written_from: "(not in the corpus)"
+    answerable: false
+    difficulty: medium
+    type: factual
