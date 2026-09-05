@@ -398,6 +398,76 @@ def test_chat_omits_tools_when_not_given(app_and_client, events):
 
 
 # ---------------------------------------------------------------------------
+# 3c. system passthrough -- the prompt services/agent actually sends (ADR-008)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_forwards_system_to_provider(app_and_client, events):
+    """Verbatim passthrough, same as `tools`: a Messages API parameter, not a
+    new capability. Until this existed, prompt_version was a label on requests
+    that were byte-identical whatever version they claimed."""
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={
+                "model_alias": "fast",
+                "messages": [{"role": "user", "content": "hi"}],
+                "system": "You are agentlake's documentation assistant.",
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    assert fake.calls[0]["system"] == "You are agentlake's documentation assistant."
+
+
+def test_chat_omits_system_when_not_given(app_and_client, events):
+    """A caller that sends no system prompt produces the request it produced
+    before this field existed -- so nothing about the gateway's existing
+    behaviour is conditional on ADR-008 having happened."""
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=10, completion_tokens=5))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat",
+            json={"model_alias": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert "system" not in fake.calls[0]
+
+
+def test_system_does_not_disturb_cost_or_price_table_stamping(app_and_client, events):
+    """The reason `system` could be a plain passthrough rather than a new code
+    path: cost_usd comes from models.yaml and token counts, neither of which a
+    system prompt changes the handling of. If this fails, the field stopped
+    being a passthrough and ADR-001's single-door accounting is at stake."""
+    fake = FakeMessages(response=fake_message(model=FAST.provider_model_id,
+                                               prompt_tokens=1000, completion_tokens=100))
+    app = app_and_client(fake)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat",
+            json={
+                "model_alias": "fast",
+                "messages": [{"role": "user", "content": "hi"}],
+                "system": "a long system prompt",
+            },
+        )
+
+    llm = next(e for e in events if e["event_type"] == "LLM_CALL")
+    assert r.json()["usage"]["cost_usd"] == pytest.approx(
+        (1000 * FAST.input_price_per_mtok + 100 * FAST.output_price_per_mtok) / 1_000_000
+    )
+    assert llm["attributes"]["price_table_version"]
+
+
+# ---------------------------------------------------------------------------
 # 4. Provider error -> HTTP error code, span status="error", gateway stays up
 # ---------------------------------------------------------------------------
 

@@ -277,14 +277,26 @@ def test_landing_table_is_not_in_lake_raw() -> None:
 
 
 def test_migrations_are_numbered_and_apply_in_that_order() -> None:
-    """metadata-init globs /sql/*.sql, so filename order IS apply order: the
-    role before the grants, the tables before the publication that names them,
-    the seed last so the initial snapshot has something to carry."""
+    """metadata-init globs /sql/*.sql, so filename order IS apply order.
+
+    The invariants are stated by role rather than by position, because a
+    migration added at the end must not be able to break them by shifting an
+    index: the role comes first (later files GRANT to it), every captured
+    table is created before the publication that names them, and the seed runs
+    after the tables it fills. Anything after the seed is additive -- 08 adds
+    columns, so golden_examples' seeded rows get NULL example_key, which the
+    unique index is nullable precisely to allow.
+    """
     names = sorted(p.name for p in METADATA_SQL.glob("*.sql"))
     assert [n[:2] for n in names] == [f"{i:02d}" for i in range(1, len(names) + 1)]
+
+    def position(fragment: str) -> int:
+        return next(i for i, n in enumerate(names) if fragment in n)
+
     assert names[0].startswith("01_role")
-    assert "publication" in names[-2]
-    assert names[-1].startswith("07_seed")
+    table_migrations = [position(t) for t in ("prompt_versions", "golden_examples", "eval_runs")]
+    assert max(table_migrations) < position("publication")
+    assert max(table_migrations) < position("seed")
 
 
 def test_publication_is_created_by_a_migration_not_by_the_connector() -> None:

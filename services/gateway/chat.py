@@ -66,6 +66,14 @@ class ChatRequest(BaseModel):
     # services/agent uses this today -- see ADR-003. Never hardcoded or
     # inspected here; the gateway stays a pure passthrough per ADR-001.
     tools: list[dict[str, Any]] | None = None
+    # The system prompt, passed through verbatim -- same argument ADR-003 #5
+    # makes for `tools`: a Messages API parameter, not a new class of
+    # capability, so cost_usd, price_table_version stamping and error mapping
+    # all work unchanged. A FIELD and not a header, unlike X-Prompt-Version
+    # beside it: that one is telemetry ABOUT the caller and the gateway only
+    # stamps it on a span; this one is an instruction TO the model and changes
+    # what the provider is asked. See ADR-008 #2.
+    system: str | None = None
 
 
 class UsageOut(BaseModel):
@@ -132,6 +140,8 @@ def provider_kwargs(payload: ChatRequest, model_cfg: ModelConfig) -> dict[str, A
         kwargs["extra_body"] = {"temperature": payload.temperature}
     if payload.tools:
         kwargs["tools"] = payload.tools
+    if payload.system:
+        kwargs["system"] = payload.system
     return kwargs
 
 

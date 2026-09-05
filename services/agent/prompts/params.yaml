@@ -1,0 +1,53 @@
+# Descriptive metadata about each prompt, published into
+# prompt_versions.params_json by scripts/load_prompts.py.
+#
+# A SIDECAR rather than front-matter in the .md files, so that a prompt file is
+# exactly and only the bytes sent to the provider. Front-matter would mean the
+# text the model sees is a parse of the file rather than the file, and an eval
+# score is only reproducible if "what was the prompt" has a byte-exact answer.
+# Config-not-code, same shape as services/gateway/models.yaml and
+# services/rag/sources.yaml.
+#
+# These keys describe INTENT; the loader adds `source` and `sha256` describing
+# provenance, and merges rather than replaces, so neither writer clobbers the
+# other. Nothing reads these at runtime -- they exist so the dimension can be
+# grouped and read by a human ("which versions claimed to require citations?")
+# without diffing five markdown files.
+#
+# v1-v3 match metadata/sql/07_seed.sql exactly, because those rows were seeded
+# before this file existed and the two must not disagree; asserted by
+# tests/test_agent.py.
+
+v1:
+  style: terse
+  cite_sources: false
+
+v2:
+  style: terse
+  cite_sources: false
+  tool_hint: true
+
+v3:
+  style: cited
+  cite_sources: true
+  tool_hint: true
+  refuse_unsourced: true
+
+# v4 is v3's text verbatim -- the bump records that it is now actually SENT as
+# a system prompt, so its intent is identical by construction.
+v4:
+  style: cited
+  cite_sources: true
+  tool_hint: true
+  refuse_unsourced: true
+
+# v5 is the deliberately degraded prompt the regression gate is demonstrated
+# against (ADR-008). Every flag v4 sets true, this one drops -- which is what
+# makes "the gate went red" attributable to a stated cause rather than to
+# noise. `degraded: true` is here so nobody deploys it by accident.
+v5:
+  style: terse
+  cite_sources: false
+  tool_hint: false
+  refuse_unsourced: false
+  degraded: true

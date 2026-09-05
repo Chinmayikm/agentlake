@@ -6,8 +6,11 @@ written against docs/adr/ADR-003's spec, not the implementation.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from services.agent.loop import DEFAULT_MAX_STEPS, DEFAULT_PROMPT_VERSION, run_turn
 from services.gateway.chat import ChatResponse, UsageOut
@@ -276,19 +279,284 @@ def test_prompt_version_is_overridable_and_reaches_every_call(events) -> None:
     assert gateway.prompt_versions == ["v4"]
 
 
-def test_default_prompt_version_matches_the_seeded_metadata_row() -> None:
-    """DEFAULT_PROMPT_VERSION has to name a row metadata/sql/07_seed.sql
-    actually inserts, or every span the agent emits lands in
-    fct_cost_by_prompt as prompt_attribution='unknown' -- which is the state
-    that is supposed to mean the CDC lander has not run.
+def test_default_prompt_version_has_a_prompt_file() -> None:
+    """DEFAULT_PROMPT_VERSION has to name a file in services/agent/prompts/, or
+    every turn raises UnknownPromptVersion before it reaches the gateway.
 
-    A file-level check on purpose: the agent deliberately does not read the
-    metadata database (see loop.py), so nothing at runtime would ever notice.
+    The prompt files are the source of truth; scripts/load_prompts.py publishes
+    them into prompt_versions. Whether the DATABASE has caught up is checked
+    downstream, in lake.analytics.fct_cost_by_prompt, where a version the
+    dimension has never held shows up as prompt_attribution='unknown' -- the
+    agent deliberately does not read the metadata database (see loop.py).
     """
+    from services.agent.prompts import available_versions, load_prompt
+
+    assert DEFAULT_PROMPT_VERSION in available_versions()
+    assert load_prompt(DEFAULT_PROMPT_VERSION).strip()
+
+
+def test_promoted_prompt_files_still_match_the_metadata_seed() -> None:
+    """v1-v3 were promoted verbatim out of metadata/sql/07_seed.sql. If the two
+    drift, `make prompts-load` silently rewrites history: the file wins, the
+    seeded row is overwritten, and every eval_result already attributed to that
+    version was scored against text the database no longer holds.
+
+    v4 and v5 are deliberately absent from the seed -- they are the loader's,
+    not the migration's, and this test says so by only checking v1-v3.
+    """
+    from services.agent.prompts import load_prompt
+
     seed = (
         Path(__file__).resolve().parents[1] / "metadata" / "sql" / "07_seed.sql"
     ).read_text(encoding="utf-8")
-    assert f"'{DEFAULT_PROMPT_VERSION}'," in seed, (
-        f"DEFAULT_PROMPT_VERSION={DEFAULT_PROMPT_VERSION!r} is not seeded in "
-        "metadata/sql/07_seed.sql"
+    # The seed wraps long templates across adjacent SQL literals, which the
+    # parser concatenates. Join them back before comparing, or this test would
+    # be asserting on line-wrapping rather than on text.
+    seed = re.sub(r"'\s*\n\s*'", "", seed)
+
+    for version in ("v1", "v2", "v3"):
+        # SQL string literals double their single quotes; the file does not.
+        assert load_prompt(version).replace("'", "''") in seed, (
+            f"services/agent/prompts/{version}.md no longer matches the "
+            f"template_text seeded for {version} in metadata/sql/07_seed.sql"
+        )
+
+
+def test_v4_is_v3s_text_and_v5_drops_the_instructions_the_eval_scores() -> None:
+    """The gate demo depends on v5 being WORSE for a stated reason, not just
+    different. v4 is v3 verbatim -- the bump records that the text now actually
+    reaches the model -- and v5 removes exactly the three instructions the
+    harness measures: search first (hit@5), cite sources (citation_ok), and
+    admit when the corpus does not answer (faithfulness on the unanswerable
+    examples). If v5 stops differing in those, a green gate proves nothing.
+    """
+    from services.agent.prompts import load_prompt
+
+    assert load_prompt("v4") == load_prompt("v3")
+
+    v5 = load_prompt("v5")
+    for instruction in (
+        "Search before answering anything factual",
+        "Cite the source of every claim",
+        "say plainly when the corpus does not answer",
+    ):
+        assert instruction in load_prompt("v4")
+        assert instruction not in v5
+
+
+# ---------------------------------------------------------------------------
+# (7) The system prompt, and what the eval harness reads off a turn (ADR-008)
+# ---------------------------------------------------------------------------
+
+
+def test_every_gateway_call_carries_the_system_prompt() -> None:
+    """Before ADR-008 no system prompt was sent at all, so v1/v2/v3 produced
+    byte-identical requests and `prompt_version` described nothing. If this
+    regresses, the eval's whole prompt A/B silently compares a label to itself.
+    """
+    from services.agent.prompts import load_prompt
+
+    gateway = FakeGateway(
+        [
+            _resp([_tool_use_block("t1", "search_docs", {"query": "q"})]),
+            _resp([_text_block("done")]),
+        ]
     )
+    asyncio.run(
+        run_turn("q", gateway=gateway, tool_executor=FakeToolExecutor(), prompt_version="v4")
+    )
+
+    assert len(gateway.requests) == 2
+    assert all(r.system == load_prompt("v4") for r in gateway.requests)
+
+
+def test_the_forced_final_call_keeps_its_system_prompt() -> None:
+    """Budget exhaustion drops `tools`, deliberately -- but not `system`. A
+    truncated turn silently switching to a different system prompt would change
+    what is being measured exactly at the point the turn is already degraded.
+    """
+    from services.agent.prompts import load_prompt
+
+    tool_calls = [
+        _resp([_tool_use_block(f"t{i}", "search_docs", {"query": "q"})]) for i in range(3)
+    ]
+    gateway = FakeGateway([*tool_calls, _resp([_text_block("partial")])])
+
+    result = asyncio.run(
+        run_turn(
+            "q",
+            gateway=gateway,
+            tool_executor=FakeToolExecutor(),
+            max_steps=3,
+            prompt_version="v5",
+        )
+    )
+
+    assert result.truncated is True
+    final = gateway.requests[-1]
+    assert final.tools is None
+    assert final.system == load_prompt("v5")
+
+
+def test_run_turn_records_what_search_docs_returned() -> None:
+    """The harness computes hit@k and citation_ok from this. It is what the
+    agent actually received, so the RETRIEVAL span is a copy of it rather than
+    the other way round -- which is why CI can score a run with no Kafka and no
+    ClickHouse anywhere.
+    """
+    observation = {
+        "results": [
+            {
+                "chunk_id": "c1",
+                "source_path": "docs/design.html",
+                "section_path": "Design > Persistence",
+                "score": 0.9,
+            },
+            {
+                "chunk_id": "c2",
+                "source_path": "docs/ops.html",
+                "section_path": "Operations",
+                "score": 0.5,
+            },
+        ]
+    }
+    gateway = FakeGateway(
+        [
+            _resp([_tool_use_block("t1", "search_docs", {"query": "q", "k": 5, "mode": "hybrid"})]),
+            _resp([_text_block("done")]),
+        ]
+    )
+
+    result = asyncio.run(
+        run_turn("q", gateway=gateway, tool_executor=FakeToolExecutor(observation))
+    )
+
+    assert [r.chunk_id for r in result.retrieved] == ["c1", "c2"]
+    assert [r.source_path for r in result.retrieved] == ["docs/design.html", "docs/ops.html"]
+    assert result.retrieved[0].section_path == "Design > Persistence"
+    assert all(r.call_index == 0 for r in result.retrieved)
+    assert result.retrieval_calls == [{"k": 5, "mode": "hybrid", "call_index": 0}]
+
+
+def test_call_index_separates_successive_search_docs_calls() -> None:
+    """hit@k is scored on the FIRST search_docs call. Without call_index the
+    metric would union every call, and an agent could brute-force it by
+    searching five times -- measuring the agent, not the retriever."""
+    observation = {"results": [{"chunk_id": "c1", "source_path": "a.md", "section_path": "S"}]}
+    gateway = FakeGateway(
+        [
+            _resp([_tool_use_block("t1", "search_docs", {"query": "one"})]),
+            _resp([_tool_use_block("t2", "search_docs", {"query": "two"})]),
+            _resp([_text_block("done")]),
+        ]
+    )
+
+    result = asyncio.run(
+        run_turn("q", gateway=gateway, tool_executor=FakeToolExecutor(observation))
+    )
+
+    assert [r.call_index for r in result.retrieved] == [0, 1]
+    assert len([r for r in result.retrieved if r.call_index == 0]) == 1
+
+
+def test_a_failed_search_docs_call_is_recorded_as_a_call_with_no_results() -> None:
+    """'the retriever missed' and 'the tool broke' must not look identical. The
+    call is counted so search_rate stays honest; it contributes no chunks, so
+    hit@k does not credit it."""
+    gateway = FakeGateway(
+        [
+            _resp([_tool_use_block("t1", "search_docs", {"query": "q"})]),
+            _resp([_text_block("done")]),
+        ]
+    )
+
+    result = asyncio.run(
+        run_turn(
+            "q",
+            gateway=gateway,
+            tool_executor=FakeToolExecutor(raises=RuntimeError("qdrant down")),
+        )
+    )
+
+    assert result.retrieved == []
+    assert len(result.retrieval_calls) == 1
+
+
+def test_final_completion_tokens_is_the_last_calls_completion_tokens() -> None:
+    """answer_len_tokens comes from here rather than len(text)//4, which
+    measures a tokenizer nobody has -- and it is the x-axis of the judge's
+    length-control correlation, so an estimate would put noise into the one
+    number the bias check depends on."""
+    tool_step = _resp([_tool_use_block("t1", "search_docs", {"query": "q"})])
+    final = _resp([_text_block("the answer")])
+    final.usage.completion_tokens = 137
+    gateway = FakeGateway([tool_step, final])
+
+    result = asyncio.run(
+        run_turn("q", gateway=gateway, tool_executor=FakeToolExecutor())
+    )
+
+    assert result.final_completion_tokens == 137
+    assert result.total_tokens == 10 + 5 + 10 + 137
+
+
+def test_unknown_prompt_version_fails_before_any_gateway_call() -> None:
+    """A typo'd --prompt-version must not spend money and then be discovered in
+    a dashboard as prompt_attribution='unknown'."""
+    from services.agent.prompts import UnknownPromptVersion
+
+    gateway = FakeGateway([_resp([_text_block("never reached")])])
+
+    with pytest.raises(UnknownPromptVersion, match="v99"):
+        asyncio.run(
+            run_turn(
+                "q", gateway=gateway, tool_executor=FakeToolExecutor(), prompt_version="v99"
+            )
+        )
+
+    assert gateway.requests == []
+
+
+def test_prompt_params_sidecar_covers_every_prompt_file() -> None:
+    """A version with no params entry publishes provenance and nothing else, so
+    the dimension cannot say what that prompt was FOR. Cheap to keep in step;
+    invisible if it drifts."""
+    from services.agent.prompts import available_versions, load_params
+
+    assert sorted(load_params()) == available_versions()
+
+
+def test_prompt_params_match_the_seeded_metadata_rows() -> None:
+    """v1-v3's params were seeded by metadata/sql/07_seed.sql before params.yaml
+    existed. scripts/load_prompts.py merges rather than replaces, so if the two
+    disagree the database ends up holding a union of two different intents and
+    neither file is the source of truth any more."""
+    import json
+
+    from services.agent.prompts import load_params
+
+    seed = (
+        Path(__file__).resolve().parents[1] / "metadata" / "sql" / "07_seed.sql"
+    ).read_text(encoding="utf-8")
+    params = load_params()
+
+    for version in ("v1", "v2", "v3"):
+        for key, value in params[version].items():
+            literal = json.dumps(value)
+            assert f'"{key}": {literal}' in seed, (
+                f"params.yaml says {version}.{key}={value!r}, which is not what "
+                f"metadata/sql/07_seed.sql seeds"
+            )
+
+
+def test_the_degraded_prompt_is_flagged_as_such() -> None:
+    """v5 exists only to make the regression gate go red. Nothing stops someone
+    running `--prompt-version v5` for real, so the dimension has to carry the
+    fact that this one is deliberately bad -- otherwise a quality drop looks
+    like a mystery rather than a label somebody ignored."""
+    from services.agent.prompts import load_params
+
+    params = load_params()
+
+    assert params["v5"]["degraded"] is True
+    assert not any(p.get("degraded") for v, p in params.items() if v != "v5")

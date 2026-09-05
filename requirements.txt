@@ -44,3 +44,11 @@ mcp==1.29.1
 # services/mcp_server: validates tool call arguments against each tool's JSON
 # Schema before dispatch -- runtime, not just CI. See ADR-003.
 jsonschema==4.26.0
+
+# metadata/client.py: the Postgres metadata database (prompt_versions,
+# golden_examples, eval_runs, eval_results). The FIRST real database driver in
+# this repo -- analytics/trino_client.py's "a tiny httpx client beats a
+# dependency" precedent (ADR-004 #2) does not transfer, because the Postgres
+# wire protocol is not HTTP. [binary] rather than source for the same reason
+# confluent-kafka ships prebuilt: no libpq-dev on the box or the CI runner.
+psycopg[binary]==3.3.5

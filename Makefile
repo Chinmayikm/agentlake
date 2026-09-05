@@ -1,4 +1,4 @@
-.PHONY: test lint gateway traces rag-preflight \
+.PHONY: test lint gateway traces rag-preflight prompts-load prompts-load-dry \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -32,6 +32,18 @@ traces:
 # hybrid was BM25-only, with no error anywhere.
 rag-preflight:
 	.venv/bin/python3 -m services.rag diagnose
+
+# --- eval harness (ADR-008) ------------------------------------------------
+#
+# Publish services/agent/prompts/*.md into prompt_versions. One direction only:
+# the files are the source of truth, and nothing reads template_text back into
+# the agent (ADR-007 #6). Needs metadata-db up (`make cdc-up`); re-running is a
+# genuine no-op, emitting no WAL and therefore no spurious CDC update.
+prompts-load:
+	.venv/bin/python3 scripts/load_prompts.py
+
+prompts-load-dry:
+	.venv/bin/python3 scripts/load_prompts.py --dry-run
 
 # --- cold path: Kafka -> Flink SQL -> Iceberg (ADR-004) ---------------------
 #
