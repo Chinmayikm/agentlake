@@ -48,6 +48,29 @@ def default_url() -> str:
     return os.environ.get("AGENTLAKE_QDRANT", DEFAULT_URL)
 
 
+def default_store() -> QdrantStore:
+    """The ONE way to build a production QdrantStore. Do not construct one
+    directly outside this module.
+
+    `corpus_version` is a search filter (see `QdrantStore.search`), so a store
+    built without it matches nothing that ingest wrote and returns zero hits --
+    silently, because zero results is also what a genuinely bad query looks
+    like. That is not hypothetical: `retrieve.py` built `QdrantStore()` while
+    `cli.py` built `QdrantStore(corpus_version=load_corpus_version())`, so
+    every library-path dense search returned nothing from ADR-003 until this
+    factory existed, and hybrid quietly degraded to BM25-only. Two call sites
+    that had to agree, and did not.
+
+    The dataclass default stays "unknown" deliberately: a `default_factory`
+    reading YAML off disk inside a constructor is hidden I/O, and "unknown" is
+    the honest value for a store nobody configured. The fix is that nothing
+    constructs an unconfigured one.
+    """
+    from services.rag.fetch import load_corpus_version
+
+    return QdrantStore(corpus_version=load_corpus_version())
+
+
 @dataclass
 class QdrantStore:
     url: str = field(default_factory=default_url)

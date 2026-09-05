@@ -201,3 +201,128 @@ def test_retrieve_span_hits_matches_result_count(
     assert len(events) == 1
     assert events[0]["attributes"]["hits"] == str(len(hits))
     assert events[0]["attributes"]["mode"] == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# The corpus_version regression (ADR-008 #1)
+# ---------------------------------------------------------------------------
+#
+# QdrantStore.search() filters on corpus_version, so a store built without one
+# matches nothing ingest wrote and returns zero hits -- indistinguishable, from
+# the outside, from a query with no good answer. retrieve.py built
+# QdrantStore() while cli.py built QdrantStore(corpus_version=...), so every
+# library-path dense search returned nothing and hybrid silently degraded to
+# BM25-only. These tests exist so that cannot come back.
+
+
+def test_default_store_is_configured_with_the_ingested_corpus_version() -> None:
+    """If this fails, dense retrieval returns zero rows in production and
+    nothing raises -- hybrid just quietly becomes BM25-only."""
+    from services.rag.fetch import load_corpus_version
+    from services.rag.qdrant_store import default_store
+
+    store = default_store()
+
+    assert store.corpus_version == load_corpus_version()
+    assert store.corpus_version != "unknown"
+
+
+@pytest.mark.parametrize("module", ["retrieve", "cli"])
+def test_no_module_builds_an_unconfigured_qdrant_store(module: str) -> None:
+    """A source-text contract, because the bug was two call sites that had to
+    agree and did not. Constructing QdrantStore(...) anywhere outside
+    qdrant_store.py reintroduces exactly that -- go through default_store()."""
+    source = (Path("services/rag") / f"{module}.py").read_text(encoding="utf-8")
+
+    assert "QdrantStore(" not in source, (
+        f"services/rag/{module}.py constructs a QdrantStore directly; "
+        f"use services.rag.qdrant_store.default_store() instead"
+    )
+    assert "default_store" in source
+
+
+def test_retrieval_span_records_the_corpus_version_it_searched(
+    events, seeded_store: CorpusStore, fake_embedder, empty_bm25
+) -> None:
+    """The attribute that would have made the bug visible: without it, a trace
+    of a zero-hit retrieval cannot distinguish a filter mismatch from a query
+    the corpus genuinely does not answer."""
+    seeded_store.corpus_version = "2026-08-27-pinned"
+
+    retrieve(
+        "log compaction",
+        k=2,
+        mode="dense",
+        store=seeded_store,
+        embedder=fake_embedder,
+        bm25_index=empty_bm25,
+    )
+
+    assert events[0]["attributes"]["corpus_version"] == "2026-08-27-pinned"
+
+
+def test_retrieval_span_omits_corpus_version_for_a_store_that_has_none(
+    events, seeded_store: CorpusStore, fake_embedder, empty_bm25
+) -> None:
+    """CorpusStore has no such concept, and _coerce_attrs drops a None -- so
+    the sqlite fake emits a span of exactly the shape it emitted before this
+    attribute existed. A null-valued entry is a shape the Avro contract's
+    value-required map says cannot exist."""
+    retrieve(
+        "log compaction",
+        k=2,
+        mode="dense",
+        store=seeded_store,
+        embedder=fake_embedder,
+        bm25_index=empty_bm25,
+    )
+
+    assert "corpus_version" not in events[0]["attributes"]
+
+
+def test_retrieval_span_records_which_documents_came_back(
+    events, seeded_store: CorpusStore, fake_embedder, empty_bm25
+) -> None:
+    """eval/'s trace-mode hit@k reads this. Without it, reading the trace means
+    resolving every chunk_id against the store -- asking the store a question
+    the trace was supposed to answer. Deduplicated: two chunks of one document
+    is the normal case and repeating its path says nothing."""
+    retrieve(
+        "log compaction retains the last value per key",
+        k=2,
+        mode="dense",
+        project="kafka",
+        store=seeded_store,
+        embedder=fake_embedder,
+        bm25_index=empty_bm25,
+    )
+
+    attrs = events[0]["attributes"]
+    assert attrs["top_chunk_ids"] == "c1,c2"
+    assert attrs["top_source_paths"] == "a.md"
+    assert "top_source_paths_truncated" not in attrs
+
+
+def test_source_paths_attribute_says_so_when_it_truncates() -> None:
+    """A shortened list that did not say it was shortened would make hit@k
+    quietly wrong rather than visibly incomplete."""
+    from services.rag.retrieve import _MAX_SOURCE_PATHS, RetrievedChunk, _source_paths_attr
+
+    many = [
+        RetrievedChunk(
+            chunk_id=f"c{i}",
+            project="kafka",
+            version="3.8",
+            section="S",
+            source_path=f"doc{i}.md",
+            text="",
+            score=1.0,
+        )
+        for i in range(_MAX_SOURCE_PATHS + 1)
+    ]
+
+    joined, truncated = _source_paths_attr(many)
+
+    assert truncated is True
+    assert joined.count(",") == _MAX_SOURCE_PATHS - 1
+    assert "doc10.md" not in joined

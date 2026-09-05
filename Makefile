@@ -1,4 +1,4 @@
-.PHONY: gateway traces \
+.PHONY: test lint gateway traces rag-preflight \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -9,11 +9,29 @@
         cdc-up cdc-down cdc-connector cdc-psql cdc-slot cdc-topic \
         cdc-table cdc-land cdc-seed
 
+# The path list here and the one in .github/workflows/ci.yml's ruff step are
+# asserted identical by tests/test_repo_hygiene.py -- "CI matches local
+# reality" only holds if the two cannot drift.
+LINT_PATHS = services/ tests/ stream/ scripts/ analytics/ quality/ metadata/
+
+test:
+	.venv/bin/python3 -m pytest -q
+
+lint:
+	.venv/bin/ruff check $(LINT_PATHS)
+
 gateway:
 	.venv/bin/uvicorn services.gateway.app:create_app --factory --reload --port 8100
 
 traces:
 	.venv/bin/python3 scripts/consume_tree.py
+
+# Is dense retrieval alive, and is hybrid actually fusing two rankings? Needs
+# qdrant up and the corpus ingested. Exits non-zero on either failure -- the
+# permanent guard for ADR-008 #1, where dense returned nothing for months and
+# hybrid was BM25-only, with no error anywhere.
+rag-preflight:
+	.venv/bin/python3 -m services.rag diagnose
 
 # --- cold path: Kafka -> Flink SQL -> Iceberg (ADR-004) ---------------------
 #

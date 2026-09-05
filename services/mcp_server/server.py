@@ -160,10 +160,10 @@ def warmup() -> bool:
     try:
         from services.mcp_server.clickhouse import ClickHouseClient
         from services.rag.embed import FastEmbedEmbedder
-        from services.rag.qdrant_store import QdrantStore
+        from services.rag.qdrant_store import default_store
 
         FastEmbedEmbedder().embed(["warmup"])
-        QdrantStore().count_chunks()
+        default_store().count_chunks()
         with ClickHouseClient() as clickhouse:
             clickhouse.ping()
         return True
