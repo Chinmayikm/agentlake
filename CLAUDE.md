@@ -15,7 +15,9 @@ Streaming lakehouse & evaluation platform for LLM agents. Solo portfolio project
 - CDC: Postgres metadata DB -> Debezium (pgoutput) -> cdc.metadata.* topics ->
   lake.cdc.prompt_versions -> dbt dimension + the fct_cost_by_prompt join.
   See metadata/ + scripts/cdc_land.py + ADR-007.
-- Planned: eval harness
+- Eval: eval/ -- 85 golden examples, an LLM judge, a regression gate. Writes
+  eval_runs/eval_results into the metadata DB, so results flow through the SAME CDC
+  pipeline. See eval/ + ADR-008.
 
 ## Compose profiles
 `docker-compose.yml` is sliced so only one heavy piece runs at a time (4 GB WSL cap):
@@ -85,10 +87,23 @@ under every profile. Stop them first:
   to call an LLM provider or hold ANTHROPIC_API_KEY. POST /v1/chat (streams as SSE when
   stream=true), GET /v1/health, GET /v1/stats. Model aliases + prices in
   services/gateway/models.yaml, never hardcoded. Details: docs/adr/ADR-001.
-- RAG corpus: services/rag, `python -m services.rag ingest|retrieve`. Hybrid (dense+BM25)
-  retrieval over pinned Kafka/Flink/Iceberg docs; QdrantStore in production, sqlite+numpy
-  as the test fake; emits RETRIEVAL spans. ingest: run with kafka+sr stopped (memory), it
-  is resume-aware. Details: docs/adr/ADR-002.
+- RAG corpus: services/rag, `python -m services.rag ingest|retrieve|diagnose`. Hybrid
+  (dense+BM25) retrieval over pinned Kafka/Flink/Iceberg docs; QdrantStore in production,
+  sqlite+numpy as the test fake; emits RETRIEVAL spans. ingest: run with kafka+sr stopped
+  (memory), it is resume-aware. Details: docs/adr/ADR-002 and ADR-008 #1.
+
+  **ALWAYS build a production store with `qdrant_store.default_store()`.** Never
+  `QdrantStore()` directly. `corpus_version` is a SEARCH FILTER, so a store built without
+  it matches nothing ingest wrote and returns zero hits -- silently, because zero results
+  is also what a bad query looks like. That is not hypothetical: `retrieve.py` and
+  `cli.py` disagreed on this from ADR-003 until ADR-008, so every library-path dense
+  search returned nothing and `mode="hybrid"` was quietly BM25-only. A test asserts no
+  module constructs one directly.
+
+  `make rag-preflight` (`python -m services.rag diagnose`) is the permanent guard and
+  exits non-zero if dense is dead or hybrid's top-k is byte-identical to bm25's. The eval
+  harness runs the same check before it will spend money. Run it after any ingest, any
+  sources.yaml bump, or any change near the store.
 - MCP server: services/mcp_server, stdio transport, `python -m services.mcp_server`.
   Exposes search_docs (wraps services.rag.retrieve), get_trace and query_metrics (both
   real as of ADR-005, backed by ClickHouse). query_metrics takes a WHITELISTED
@@ -97,10 +112,64 @@ under every profile. Stop them first:
   structured {"error": ...} rather than fabricate when the store is unreachable or the
   trace is gone. Every tool call emits a TOOL_CALL span. Details: docs/adr/ADR-003 and
   ADR-005.
-- Agent: services/agent, `python -m services.agent "question" [--session ID] [--quality]`.
-  Bounded tool-use loop (max 8 steps) over the gateway + services/mcp_server (spawned as
-  a stdio subprocess -- a real MCP client, never a direct retrieve() import). Details:
-  docs/adr/ADR-003.
+- Agent: services/agent, `python -m services.agent "question" [--session ID] [--quality]
+  [--prompt-version V]`. Bounded tool-use loop (max 8 steps) over the gateway +
+  services/mcp_server (spawned as a stdio subprocess -- a real MCP client, never a
+  direct retrieve() import). Details: docs/adr/ADR-003.
+
+  **It sends a real system prompt, as of ADR-008.** The text lives in
+  `services/agent/prompts/<version>.md` and is sent via `ChatRequest.system` (a verbatim
+  gateway passthrough, the same argument ADR-003 #5 makes for `tools`). Before this,
+  `prompt_version` was a pure LABEL: no system prompt was sent at all, so v1/v2/v3
+  produced byte-identical requests and `prompt_versions.template_text` was read by
+  nothing. `DEFAULT_PROMPT_VERSION = "v4"`, whose text is v3's verbatim -- the bump
+  records a change in DELIVERY, not wording.
+
+  **v5 is deliberately degraded** and exists only to make the eval gate go red: it drops
+  the three instructions the harness scores (search first, cite sources, admit when the
+  corpus does not answer). `params.yaml` marks it `degraded: true`.
+
+  Prompts are files, not database rows, and the flow is one direction only:
+  `make prompts-load` publishes them into `prompt_versions`; nothing reads template_text
+  back into the agent (ADR-007 #6). Re-running the loader is a genuine no-op -- no WAL,
+  so no spurious CDC update.
+
+- Eval harness: eval/, `python -m eval <subcommand>`. Details: docs/adr/ADR-008.
+
+  **Free, and safe to run any time:**
+
+      make eval-validate     # golden set: tags, stratification, every source resolves
+      make eval-ab           # retrieval A/B over all 85 -- needs ONLY qdrant, no cost
+      make eval-load         # publish the golden set into golden_examples
+      make eval-ledger       # what has been spent, and what is left
+
+  **These spend real money.** Each prints an estimate, refuses to start if the ledger
+  says it cannot finish inside the cap, checks after every example, and appends the
+  actual cost (from the gateway's own /v1/stats) to `eval/.spend.json` (gitignored):
+
+      make eval-pilot        # 3 examples, to MEASURE per-example cost before committing
+      make eval-baseline     # two identical 25-example runs -> eval/baseline.json
+      make eval-ci           # the 25-example subset, gated against the baseline
+      make eval              # all 85 -- DEFERRED under the current budget
+
+  A run needs, all at once: kafka + schema-registry (span emit), qdrant (retrieval),
+  metadata-db (results), and `make gateway` in another shell -- roughly 1.2 GB of
+  containers. STOP the streaming and analytics slices first.
+
+  Published numbers live in `docs/eval/` and `eval/baseline.json`. **Every run figure is
+  the 25-example CI subset**; only `retrieval_ab.md` covers all 85, because it is
+  retrieval-only and costs nothing.
+
+  Two things worth knowing before touching this:
+
+  - **`make eval-ab` says hybrid is WORSE than dense** (0.8659 vs 0.9146 hit@5). Fusion
+    helps on flink (81 documents) and hurts badly on kafka (3 documents). `mode="hybrid"`
+    is still the default -- changing it is a design decision, not an eval output --
+    but ADR-002 #3's choice is now measured rather than assumed.
+  - **The CI gate costs ~$1 and ~8-10 min per gated PR**, recurring. If that hurts, the
+    knob is a smaller CI subset, NOT a wider threshold: ADR-008 #7 explains why a
+    threshold widened to hide noise stops being a gate.
+
 - Cold path: stream/flink. Two Flink SQL jobs (no PyFlink, no DataStream API) from
   traces.events.v1 into Iceberg -- `01_raw_sink.sql` (append, all 13 contract fields,
   hidden-partitioned by day(ts_epoch_ms)) and `02_agg_model_5m.sql` (event-time 5-min
@@ -288,17 +357,28 @@ under every profile. Stop them first:
 
 ## Tests & CI
 - `python -m pytest -q` -- no Kafka, Flink or Docker needed (injectable emitters block the Kafka path in
-  tests, see tests/conftest.py); `ruff check services/ tests/ stream/ scripts/ analytics/ quality/ metadata/` for
-  lint (rule set pinned in pyproject.toml)
+  tests, see tests/conftest.py). `make test` and `make lint` are the same two commands;
+  the Makefile's LINT_PATHS and CI's `ruff check` argument list are asserted identical by
+  tests/test_repo_hygiene.py, so adding a top-level package means editing both.
+  No test makes an API call, opens a database connection, or reaches Qdrant -- the eval
+  harness is injectable end to end and a source-text contract enforces it.
 - CI (.github/workflows/ci.yml) on every PR: lint, test, a schema-compat gate that only
   runs when contracts/ changed, and a `quality` gate that only runs when the analytics
   layer's inputs changed. The quality job runs the analytics slice FOR REAL on the
   runner -- trino + iceberg-rest + minio, tables from `stream.flink.create_tables`,
   rows from `scripts/seed_iceberg.py` and `scripts/cdc_land.py seed`, then `dbt build`
   and the GE checkpoint. It fits because Kafka, Flink and Marquez are excluded;
-  ADR-006 #10 records what that leaves uncovered, and ADR-007 #10 adds that CI runs
-  neither Postgres nor Debezium -- capture is covered by ADR-007's verification log,
-  not by CI.
+  ADR-006 #10 records what that leaves uncovered.
+- CI also has an `eval-gate` (ADR-008 #9), in TWO jobs because `secrets` is not usable
+  in a job-level `if:` but is usable in a step-level `env:` -- `eval-preflight` converts
+  "does the key exist" into a boolean output. It runs only when services/agent/,
+  services/rag/, services/gateway/, eval/ or metadata/sql/ changed AND an
+  ANTHROPIC_API_KEY secret is available. **A fork PR gets a loud green notice, never a
+  red X** -- and ADR-008 #10 states the cost of that plainly: those changes ship
+  ungated. It runs the REAL qdrant and the real ingest (a sqlite CorpusStore is exact
+  cosine against Qdrant's HNSW, so CI would need its own baseline), with actions/cache
+  on the three sparse clones. It also starts Postgres, which PARTIALLY closes ADR-007
+  #10's "CI runs neither Postgres nor Debezium" -- Postgres now yes, Debezium still no.
 
 ## Conventions
 - Trunk-based: feat/* branches, squash-merge PRs to main, conventional commits (feat:/fix:/docs:/test:/chore:)

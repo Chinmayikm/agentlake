@@ -2,24 +2,38 @@
   "id": null,
   "uid": "agentlake-quality",
   "title": "agentlake / quality",
-  "description": "Skeleton for the eval harness (Day 5). The cost and token panels run real SQL against agentlake.trace_events_rt and are empty only because nothing sets a prompt_version attribute yet. The eval-score panels are deliberately text, not charts: an observability platform does not get to fabricate its own quality numbers. See ADR-005 and ADR-003 #3.",
-  "tags": ["agentlake", "hotpath", "quality"],
+  "description": "Cost and tokens per turn by prompt version, from agentlake.trace_events_rt. The eval-score panels are text, not charts, and stay that way: eval scores are rows in Postgres, not spans, and inventing a span type to make them chartable would be the fabrication this dashboard's own text refuses. See ADR-007 #6 and ADR-008.",
+  "tags": [
+    "agentlake",
+    "hotpath",
+    "quality"
+  ],
   "timezone": "",
   "editable": true,
   "schemaVersion": 41,
   "version": 1,
   "refresh": "30s",
-  "time": { "from": "now-24h", "to": "now" },
-  "templating": { "list": [] },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
   "panels": [
     {
       "id": 1,
       "type": "text",
-      "title": "What is wired and what is not",
-      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "title": "What these panels are, and where the eval numbers live",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "options": {
         "mode": "markdown",
-        "content": "**Live now.** The two panels below run real SQL against `agentlake.trace_events_rt`, filtered on `attributes['prompt_version']`. They return no rows because nothing in the agent sets that attribute yet, not because they are stubbed. Emit one `prompt_version` attribute from `services/agent` and they populate with no dashboard change.\n\n**Not yet.** Eval scores (pass rate, judge score, regression against a pinned suite) need the eval harness, which does not exist. Those panels are this text rather than a chart against a table that is not there: a dashboard that shows a plausible number it did not measure is the same failure `get_trace` and `query_metrics` refused to commit as honest stubs (ADR-003 #3), just rendered in colour."
+        "content": "**Live.** The two panels below run real SQL against `agentlake.trace_events_rt`, filtered on `attributes['prompt_version']`. `services/agent` stamps that on every AGENT_STEP and, via the `X-Prompt-Version` header, on every LLM_CALL -- which is the one that carries `cost_usd` and tokens, and therefore the only one these panels can divide (ADR-007 #6).\n\n**Read them together with the eval.** A prompt that stops searching is *cheaper* per turn and *worse*: the ADR-008 v4-vs-v5 comparison shows exactly that. On cost alone this dashboard would recommend the worse prompt. That is not a flaw in the panels -- it is why quality is measured somewhere else and the two are read side by side.\n\n**Eval scores are not here, and not because they are unfinished.** They live in `eval_runs` / `eval_results` in the metadata database, and Grafana here has only a ClickHouse datasource. Getting them onto this dashboard means a Trino datasource, not a new span type -- see the panels below."
       }
     },
     {
@@ -27,14 +41,48 @@
       "type": "timeseries",
       "title": "Cost per turn by prompt version",
       "description": "trace_id is one turn (ADR-003 #4), so cost per turn is sum(cost_usd) over distinct trace_ids. Empty until something sets a prompt_version attribute.",
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
-      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 5, "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "auto" } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 5,
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
           "editorType": "sql",
           "format": 0,
           "rawSql": "SELECT $__timeInterval_ms(ts) AS time, attributes['prompt_version'] AS prompt_version, sum(cost_usd) / greatest(uniqExact(trace_id), 1) AS cost_per_turn_usd FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND attributes['prompt_version'] != '' GROUP BY time, prompt_version ORDER BY time"
@@ -45,14 +93,47 @@
       "id": 3,
       "type": "timeseries",
       "title": "Tokens per turn by prompt version",
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
-      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "auto" } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
           "editorType": "sql",
           "format": 0,
           "rawSql": "SELECT $__timeInterval_ms(ts) AS time, attributes['prompt_version'] AS prompt_version, (sum(prompt_tokens) + sum(completion_tokens)) / greatest(uniqExact(trace_id), 1) AS tokens_per_turn FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) AND attributes['prompt_version'] != '' GROUP BY time, prompt_version ORDER BY time"
@@ -64,14 +145,53 @@
       "type": "table",
       "title": "Turn cost distribution (all traffic)",
       "description": "The one panel here with data today: per-turn cost and step count across every trace, whether or not it carries a prompt_version. It is what the two panels above will look like once they have a dimension to split on.",
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
-      "fieldConfig": { "defaults": {}, "overrides": [{ "matcher": { "id": "byName", "options": "cost_usd" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 5 }] }] },
-      "options": { "showHeader": true, "sortBy": [{ "displayName": "cost_usd", "desc": true }] },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cost_usd"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "cost_usd",
+            "desc": true
+          }
+        ]
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
           "editorType": "sql",
           "format": 1,
           "rawSql": "SELECT trace_id, sum(cost_usd) AS cost_usd, sum(prompt_tokens) + sum(completion_tokens) AS tokens, uniqExact(span_id) AS spans, countIf(status != 'ok') AS errors FROM agentlake.trace_events_rt WHERE $__timeFilter_ms(ts) GROUP BY trace_id ORDER BY cost_usd DESC LIMIT 20"
@@ -81,21 +201,31 @@
     {
       "id": 5,
       "type": "text",
-      "title": "Eval pass rate — placeholder",
-      "gridPos": { "h": 9, "w": 6, "x": 12, "y": 14 },
+      "title": "Eval pass rate \u2014 measured, but not from ClickHouse",
+      "gridPos": {
+        "h": 9,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      },
       "options": {
         "mode": "markdown",
-        "content": "### Not measured yet\n\nNeeds the eval harness: a pinned question set, a scoring function, and a run id written back as spans.\n\nWhen it exists this becomes a timeseries of pass rate by `prompt_version`, from the same table as every other panel here.\n\n**Not** a chart of zeroes, and not a chart against a table that does not exist."
+        "content": "### Measured in Postgres, not in spans\n\n`make eval-ci` writes one `eval_results` row per graded example -- `hit_at_k`, `citation_ok`, `faithfulness`, `answer_quality` -- and an `eval_runs` row pinning the git sha, prompt version, corpus version and judge model that produced them.\n\n**Why not a chart here.** A score is not a span. Emitting one as a span would need a new symbol in the Avro `EventType` enum, which the Flink reader schema would reject -- and stamping it on an `AGENT_STEP` would be labelling something that is not an agent step. Neither is worth doing to make a chart fit a datasource.\n\nThe published numbers are in `docs/eval/` and `eval/baseline.json`. Charting them needs a Trino datasource against `lake.analytics`, which is noted in ADR-008 and not built."
       }
     },
     {
       "id": 6,
       "type": "text",
-      "title": "Judge score — placeholder",
-      "gridPos": { "h": 9, "w": 6, "x": 18, "y": 14 },
+      "title": "Judge score \u2014 see docs/eval/agreement.md",
+      "gridPos": {
+        "h": 9,
+        "w": 6,
+        "x": 18,
+        "y": 14
+      },
       "options": {
         "mode": "markdown",
-        "content": "### Not measured yet\n\nAn LLM-judge score per turn, emitted as a span attribute so it lands in `trace_events_rt` alongside the cost it should be traded off against.\n\nThe interesting panel is score against `cost_per_turn_usd`, which is why that one is already live above."
+        "content": "### The judge is validated, not just reported\n\nTwo rubric-anchored 1-5 scales per answer (`eval/rubric/`), graded by `claude-sonnet-5` through this platform's own gateway -- so judging is itself traced and costed, under `prompt_version = judge-v1`. **Judge spend shows up in the panels below as its own series**, which is deliberate: the cost of measuring quality is a cost.\n\nA judge score is only worth reporting if someone has checked it tracks a human's. `make eval-label` emits a hand-labelling sheet -- without the judge's score on it, so it cannot anchor the labeller -- and `make eval-agreement` writes exact and within-1 agreement, plus Cohen's and quadratic-weighted kappa, to `docs/eval/agreement.md`, alongside a plain statement of what n=30 cannot establish."
       }
     }
   ]

@@ -242,6 +242,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     """**COSTS REAL MONEY.** Run the agent over the golden set and grade it."""
     import asyncio
 
+    from eval.budget import BudgetExceeded
     from eval.harness import format_summary, git_sha
     from eval.runner import ExpensiveStepRefused, execute
 
@@ -277,7 +278,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
             )
         )
-    except ExpensiveStepRefused as exc:
+    except (ExpensiveStepRefused, BudgetExceeded) as exc:
         print(f"\n{exc}", file=sys.stderr)
         return 2
     if summary is None:
@@ -334,6 +335,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     import asyncio
 
     from eval.baseline import Baseline
+    from eval.budget import BudgetExceeded
     from eval.dataset import DATASET_VERSION
     from eval.harness import format_summary, git_sha
     from eval.runner import ExpensiveStepRefused, execute
@@ -370,7 +372,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
                     notes=f"{label} for eval/baseline.json",
                 )
             )
-        except ExpensiveStepRefused as exc:
+        except (ExpensiveStepRefused, BudgetExceeded) as exc:
             print(f"\n{exc}", file=sys.stderr)
             return 2
         print(format_summary(summary, label=label))
