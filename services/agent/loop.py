@@ -38,6 +38,11 @@ from services.sdk import session, span
 DEFAULT_MAX_STEPS = 8
 DEFAULT_TOOL_TIMEOUT = 15.0
 
+#: Per-chunk cap on the text carried back on AgentResult. Comfortably above
+#: eval/judge.py's own 1200-char truncation, so the judge decides how much it
+#: reads rather than inheriting a limit from here.
+MAX_CHUNK_TEXT = 2000
+
 #: Which prompt template this agent is running. Stamped onto the AGENT_STEP span
 #: here, and sent to the gateway as X-Prompt-Version so it reaches the LLM_CALL
 #: span too -- which is the one that carries cost_usd and tokens, and therefore
@@ -101,6 +106,13 @@ class RetrievedRef:
     section_path: str
     score: float
     call_index: int
+    #: The chunk body the agent was shown. Carried because it is the ONLY
+    #: in-process copy: the RETRIEVAL span records which documents came back,
+    #: not what they said, and a faithfulness judge handed passage headers with
+    #: no content correctly scores every answer as fabricated. Truncated,
+    #: because the judge truncates anyway and an eval run holds every chunk of
+    #: every call in memory at once.
+    text: str = ""
 
 
 @dataclass(slots=True)
@@ -163,6 +175,7 @@ def _collect_retrieval(
                 section_path=str(result.get("section_path", "")),
                 score=float(result.get("score") or 0.0),
                 call_index=call_index,
+                text=str(result.get("text", ""))[:MAX_CHUNK_TEXT],
             )
         )
 

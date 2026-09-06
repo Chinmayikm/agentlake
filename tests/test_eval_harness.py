@@ -54,6 +54,10 @@ class Ref:
     call_index: int = 0
     text: str = "Kafka guarantees at-least-once delivery by default."
 
+    @property
+    def chunk_id(self) -> str:
+        return f"{self.source_path}:{self.text}"
+
 
 @dataclass
 class FakeResult:
@@ -494,3 +498,61 @@ def test_example_outcome_defaults_are_null_not_zero() -> None:
     assert outcome.faithfulness is None
     assert outcome.hit_at_k is None
     assert outcome.judge_parse_ok is None
+
+
+# ---------------------------------------------------------------------------
+# 7. The judge sees the evidence (the bug the pilot caught)
+# ---------------------------------------------------------------------------
+
+
+def test_the_judge_receives_the_chunk_text_not_just_the_paths() -> None:
+    """The pilot found this the expensive way: RetrievedRef carried no `text`,
+    so the faithfulness judge was handed passage HEADERS with empty bodies and
+    correctly scored every answer as fabricated -- faithfulness 1.67 against a
+    hit rate of 1.00, which is incoherent on its face.
+
+    The RETRIEVAL span records which documents came back, not what they said,
+    so AgentResult is the only in-process copy of the evidence.
+    """
+    captured: dict = {}
+
+    inner = judge_returning()
+
+    async def judge_fn(**kwargs):
+        captured.update(kwargs)
+        return await inner(**kwargs)
+
+    result = FakeResult(retrieved=[Ref("docs/design.html", text="THE EVIDENCE")])
+    _score(example(), turn_runner(result), judge_fn)
+
+    assert captured["chunks"] == [
+        {
+            "source_path": "docs/design.html",
+            "section_path": "S",
+            "text": "THE EVIDENCE",
+        }
+    ]
+
+
+def test_repeated_chunks_are_shown_to_the_judge_once() -> None:
+    """Across calls an agent frequently re-retrieves the same chunk. Showing it
+    twice spends context to tell the judge nothing."""
+    from eval.harness import _judge_chunks
+
+    chunks = _judge_chunks(
+        [Ref("a.md", text="one"), Ref("a.md", text="one"), Ref("b.md", text="two")]
+    )
+    assert len(chunks) == 2
+
+
+def test_the_judge_sees_every_call_not_just_the_first() -> None:
+    """hit@k is scored on the first search_docs call, because that measures the
+    RETRIEVER. Faithfulness asks whether the ANSWER is supported, and the
+    answer may rest on anything the agent was shown -- judging it against a
+    subset of its own evidence would score a correct answer as fabricated."""
+    from eval.harness import _judge_chunks
+
+    chunks = _judge_chunks(
+        [Ref("a.md", call_index=0, text="first"), Ref("b.md", call_index=3, text="later")]
+    )
+    assert [c["text"] for c in chunks] == ["first", "later"]

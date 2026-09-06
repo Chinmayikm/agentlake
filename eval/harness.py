@@ -248,10 +248,7 @@ async def score_example(
         outcome.hit_source = "n/a"
 
     if judge_fn is not None:
-        chunks = [
-            {"source_path": r.source_path, "section_path": r.section_path, "text": t}
-            for r, t in zip(retrieved, _texts_of(result.retrieved), strict=False)
-        ]
+        chunks = _judge_chunks(result.retrieved)
         verdict = await judge_fn(
             question=example.question,
             answer=result.answer,
@@ -270,8 +267,35 @@ async def score_example(
     return outcome
 
 
-def _texts_of(refs: Sequence[Any]) -> list[str]:
-    return [getattr(r, "text", "") for r in refs]
+def _judge_chunks(refs: Sequence[Any]) -> list[dict[str, str]]:
+    """The passages the faithfulness judge grades against.
+
+    Deduplicated by chunk_id and kept in the order the agent saw them. Across
+    calls the agent frequently re-retrieves the same chunk, and showing it
+    twice would spend context to tell the judge nothing.
+
+    NOT restricted to the first search_docs call: hit@k is scored on the first
+    call because that measures the retriever, but faithfulness asks whether the
+    ANSWER is supported, and the answer may rest on anything the agent was
+    shown. Judging it against a subset of its own evidence would score a
+    correct answer as fabricated -- which is exactly what the pilot caught when
+    the text was missing entirely.
+    """
+    seen: set[str] = set()
+    chunks: list[dict[str, str]] = []
+    for ref in refs:
+        chunk_id = getattr(ref, "chunk_id", "")
+        if chunk_id and chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        chunks.append(
+            {
+                "source_path": getattr(ref, "source_path", ""),
+                "section_path": getattr(ref, "section_path", ""),
+                "text": getattr(ref, "text", ""),
+            }
+        )
+    return chunks
 
 
 async def run_eval(

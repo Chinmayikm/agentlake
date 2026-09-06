@@ -48,7 +48,12 @@ JUDGE_PROMPT_VERSION = "judge-v1"
 #: truncated passage from a complete one would score a correct answer
 #: unfaithful for citing something just past the cut.
 MAX_CHUNK_CHARS = 1200
-MAX_CHUNKS = 5
+#: An agent that searches several times can be shown far more than one call's
+#: worth. Eight is a compromise: enough that most turns are fully covered,
+#: bounded so a chatty turn does not make judging cost more than answering.
+#: When it bites, `render_passages` SAYS SO -- a judge that cannot tell
+#: "unsupported" from "not shown" scores a correct answer as fabricated.
+MAX_CHUNKS = 8
 
 _SCORE_MIN, _SCORE_MAX = 1, 5
 _MAX_RATIONALE = 400
@@ -114,7 +119,16 @@ def render_passages(chunks: list[dict[str, str]]) -> str:
         section = chunk.get("section_path", "")
         header = f"{source}" + (f" — {section}" if section else "")
         parts.append(f"<passage {i}: {header}>\n{body}{marker}\n</passage {i}>")
-    return "\n\n".join(parts) if parts else "(no passages were retrieved)"
+    if not parts:
+        return "(no passages were retrieved)"
+    omitted = len(chunks) - MAX_CHUNKS
+    if omitted > 0:
+        parts.append(
+            f"({omitted} further passage(s) were retrieved but are not shown here. "
+            f"Do not treat a claim as unsupported merely because you cannot see its "
+            f"source among these.)"
+        )
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
