@@ -1,5 +1,6 @@
 .PHONY: test lint gateway traces rag-preflight prompts-load prompts-load-dry \
-        eval-validate eval-corpus-paths eval-ab \
+        eval-validate eval-corpus-paths eval-ab eval-load eval-pilot eval \
+        eval-ci eval-baseline eval-label eval-agreement eval-ledger \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -65,6 +66,64 @@ eval-corpus-paths:
 # how docs/eval/retrieval_ab.md's before/after pair is measured.
 eval-ab:
 	.venv/bin/python3 -m eval ab --out docs/eval/retrieval_ab.md
+
+# Publish eval/golden/*.yaml into golden_examples. Free; needs metadata-db.
+# Never deletes: eval_results FK-reference these rows, so an orphan is reported
+# and left alone rather than removed.
+eval-load:
+	.venv/bin/python3 -m eval load-golden
+
+# ---------------------------------------------------------------------------
+# THE TARGETS BELOW SPEND REAL MONEY.
+# ---------------------------------------------------------------------------
+#
+# Every one of them prints an estimate, refuses to start if the ledger says it
+# cannot finish inside the cap, checks after every example, and appends what it
+# actually cost to eval/.spend.json (gitignored). Cost figures come from the
+# gateway's own /v1/stats, which is the only thing in this repo entitled to
+# compute them.
+#
+# They need, all at once: kafka + schema-registry (span emit), qdrant
+# (retrieval), metadata-db (results), and `make gateway` in another shell.
+# STOP the streaming and analytics slices first -- see ADR-008's runbook.
+#
+# A pilot first. Three examples, so the projected per-example cost is measured
+# rather than assumed before a 25-example run is authorised:
+#   make eval-pilot
+eval-pilot:
+	.venv/bin/python3 -m eval run --subset ci --limit 3 --label "pilot" --yes
+
+# The full 85-example set. DEFERRED under the current budget -- every published
+# run number is the 25-example CI subset. Left here because it is the command,
+# not because it has been run.
+eval:
+	.venv/bin/python3 -m eval run --subset all --label "full run"
+
+# The 25-example CI subset, compared against eval/baseline.json. This is what
+# the eval-gate CI job runs. Exit 1 = quality regression; exit 3 = harness
+# failure -- different problems, different exit codes.
+eval-ci:
+	.venv/bin/python3 -m eval run --subset ci --gate --require-clean --yes --label "eval-ci"
+
+# Two identical runs -> eval/baseline.json. Refuses a dirty tree: a baseline
+# pinned to a commit nobody can check out is not a baseline.
+eval-baseline:
+	.venv/bin/python3 -m eval baseline --subset ci --yes
+
+# Free again from here.
+#
+# Emit a stratified 30-row hand-labelling sheet from the most recent completed
+# run. The judge's own score is deliberately absent from it.
+eval-label:
+	.venv/bin/python3 -m eval label --run latest --n 30
+
+# Score a filled sheet: make eval-agreement SHEET=docs/eval/labels/run-N.csv
+eval-agreement:
+	.venv/bin/python3 -m eval agreement --sheet $(SHEET)
+
+# What has been spent so far, and what is left.
+eval-ledger:
+	@.venv/bin/python3 -c "from eval.budget import Ledger; print(Ledger.load().render())"
 
 # --- cold path: Kafka -> Flink SQL -> Iceberg (ADR-004) ---------------------
 #

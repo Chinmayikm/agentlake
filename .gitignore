@@ -28,3 +28,6 @@ dbt/logs/
 # Generated on first run: a random anonymous id dbt uses for its own telemetry.
 # Machine-local, not source.
 dbt/.user.yml
+
+# eval harness: the spend ledger is local state, not a repo artifact.
+eval/.spend.json
