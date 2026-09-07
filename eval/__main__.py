@@ -341,6 +341,9 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     from eval.runner import ExpensiveStepRefused, execute
     from services.rag.fetch import load_corpus_version
 
+    if args.from_runs:
+        return _baseline_from_runs(args)
+
     sha = git_sha()
     if sha.endswith("-dirty"):
         print(
@@ -407,6 +410,146 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         sigma = baseline.sigma.get(key, 0.0)
         print(f"  {key:<24} sigma={sigma:.4f}  threshold={value:.4f}")
     return 0
+
+
+def _baseline_from_runs(args: argparse.Namespace) -> int:
+    """Write eval/baseline.json from runs ALREADY in the metadata database.
+
+    Free, and it is the honest way to salvage a baseline attempt that only
+    half-happened. `make eval-baseline` spends ~$2.40 to produce two summaries
+    in memory; those summaries are also rows in `eval_results`, so re-spending
+    it to recompute numbers that are already stored would be paying twice for
+    the same measurement.
+
+    One run id gives a single-run baseline with declared thresholds; two give
+    the sigma-derived ones. More than two is refused rather than averaged --
+    `sigma_from_two` is exactly a two-observation estimator, and silently
+    generalising it would make the file's threshold math a lie.
+    """
+    from eval.baseline import Baseline
+    from eval.gate import RunNotFound, load_run
+    from metadata.client import MetadataUnavailableError, connect, redacted_dsn
+
+    ids = args.from_runs
+    if len(ids) > 2:
+        print(
+            f"error: --from-runs takes 1 or 2 run ids, got {len(ids)}. The two-run "
+            f"threshold math is a two-observation estimator (eval/baseline.py); "
+            f"averaging more runs through it would not mean what it says.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"metadata: {redacted_dsn()}")
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            runs = [load_run(cur, run_id) for run_id in ids]
+    except (MetadataUnavailableError, RunNotFound) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    for run in runs:
+        print(
+            f"  run {run.run_id}: n={run.n}  failures={run.failures}  "
+            f"judge_parse_failures={run.judge_parse_failures}  "
+            f"${run.total_cost_usd:.4f}  {'finished' if run.finished else 'UNFINISHED'}"
+        )
+        if run.failures or not run.finished:
+            print(
+                f"error: run {run.run_id} is not baselineable -- an unfinished run or "
+                f"one with harness failures measures the harness, not the agent.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # PINNED must agree across two runs, for the same reason compare() checks
+    # it: a "baseline" averaged over two configurations describes neither.
+    if len(runs) == 2:
+        mismatched = [
+            k for k in ("dataset_version", "corpus_version", "prompt_version", "judge_model", "n")
+            if runs[0].config.get(k) != runs[1].config.get(k)
+        ]
+        if mismatched:
+            print(
+                f"error: runs {ids[0]} and {ids[1]} differ on {', '.join(mismatched)}. "
+                f"They are not two observations of one configuration.",
+                file=sys.stderr,
+            )
+            return 2
+
+    config = {
+        "git_sha": runs[0].config["git_sha"],
+        "dataset_version": runs[0].config["dataset_version"],
+        "corpus_version": runs[0].config["corpus_version"],
+        "prompt_version": runs[0].config["prompt_version"],
+        "model_alias": runs[0].config["model_alias"],
+        "max_steps": runs[0].config["max_steps"],
+        "judge_model": runs[0].config["judge_model"],
+        "judge_seed": runs[0].config["judge_seed"],
+        "n": runs[0].n,
+        "run_ids": [r.run_id for r in runs],
+    }
+    if len(runs) == 1:
+        baseline = Baseline.from_single(runs[0].metrics, config, notes=args.notes or "")
+    else:
+        baseline = Baseline.from_runs(runs[0].metrics, runs[1].metrics, config)
+    baseline.save()
+
+    print("\nwrote eval/baseline.json")
+    for key, value in sorted(baseline.thresholds.items()):
+        sigma = baseline.sigma.get(key)
+        source = f"sigma={sigma:.4f}" if sigma is not None else "declared (no sigma)"
+        print(f"  {key:<24}{baseline.metrics.get(key, 0.0) or 0.0:>9.4f}   "
+              f"threshold={value:.4f}  {source}")
+    if len(runs) == 1:
+        print(
+            "\nThis baseline rests on ONE run, so no run-to-run sigma was measured "
+            "and\nthe thresholds are hand-set. `make eval-baseline` replaces it with "
+            "the\nsigma-derived ones when there is budget for two runs."
+        )
+    return 0
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """Gate a run already in the metadata database against eval/baseline.json.
+
+    Free -- it reads rows, it does not produce them. Exit 0 pass, 1 quality
+    regression or config drift, 2 could not compare, 3 harness failure.
+    """
+    from eval.baseline import Baseline, BaselineError
+    from eval.gate import RunNotFound, check, load_run
+    from metadata.client import MetadataUnavailableError, connect
+
+    try:
+        baseline = Baseline.load()
+    except BaselineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            run = load_run(cur, args.run)
+    except (MetadataUnavailableError, RunNotFound) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    result = check(baseline, run, allow_config_drift=args.allow_config_drift)
+    print(result.render())
+
+    # Same split as _gate(): "the harness fell over" and "the answers got
+    # worse" need different responses, and reporting the first as the second
+    # sends someone hunting a regression that is not there.
+    if run.failures:
+        print(f"HARNESS FAILURE: {run.failures} example(s) errored", file=sys.stderr)
+        return 3
+    if run.judge_parse_failures > 2:
+        print(
+            f"HARNESS FAILURE: {run.judge_parse_failures} judge replies were "
+            f"unparseable (limit 2)",
+            file=sys.stderr,
+        )
+        return 3
+    return 0 if result.passed else 1
 
 
 def cmd_label(args: argparse.Namespace) -> int:
@@ -632,7 +775,24 @@ def build_parser() -> argparse.ArgumentParser:
         "baseline", help="**COSTS MONEY** two identical runs -> eval/baseline.json"
     )
     add_run_flags(baseline)
+    baseline.add_argument(
+        "--from-runs",
+        nargs="+",
+        type=int,
+        default=[],
+        metavar="RUN_ID",
+        help="FREE. Build eval/baseline.json from runs already in the metadata "
+        "database instead of executing new ones. One id gives a single-run "
+        "baseline with declared thresholds; two give the sigma-derived ones.",
+    )
     baseline.set_defaults(func=cmd_baseline)
+
+    gate = sub.add_parser(
+        "gate", help="gate a stored run against eval/baseline.json (free)"
+    )
+    gate.add_argument("--run", default="latest", help="run id, or 'latest'")
+    gate.add_argument("--allow-config-drift", action="store_true")
+    gate.set_defaults(func=cmd_gate)
 
     label = sub.add_parser("label", help="emit a hand-labelling sheet from a run (free)")
     label.add_argument("--run", default="latest", help="run id, or 'latest'")

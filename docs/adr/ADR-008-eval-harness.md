@@ -589,11 +589,259 @@ All checks passed!
 Zero of those tests make an API call, open a database connection, or reach
 Qdrant — asserted for the harness by a source-text contract.
 
-### 6. Still to measure
+### 6. Baseline and gate — $1.81 of the ledger, then free
 
-- The pilot's measured per-example cost, and the projection it licenses.
-- Two baseline runs, σ̂, and the derived thresholds → `eval/baseline.json`.
+```
+$ make eval-baseline-from RUNS=3          # free; reads run 3 back out of Postgres
+  run 3: n=25  failures=0  judge_parse_failures=0  $1.1751  finished
+wrote eval/baseline.json
+  citation_ok_rate    1.0000   threshold=0.0000  declared (no sigma)
+  faithfulness_mean   3.4400   threshold=0.3000  declared (no sigma)
+  hit_at_5_rate       0.6667   threshold=0.1000  declared (no sigma)
+
+$ make eval-gate RUN=3                    # free; exit 0
+  faithfulness_mean   3.4400  3.4400  +0.0000  -0.3000  ok
+  hit_at_5_rate       0.6667  0.6667  +0.0000  -0.1000  ok
+  citation_ok_rate    1.0000  1.0000  +0.0000  -0.0000  ok
+  RESULT: PASS
+
+$ make eval-gate RUN=4                    # exit 2 -- the drift guard, §13
+  CONFIG DRIFT -- these runs are not comparable:
+    n: baseline 25 != run 17
+```
+
+Ledger after both baseline attempts: **$2.0097 spent of a $4.25 abort cap**,
+$2.2403 remaining. Run 4's $0.6300 is in that total because run 4 was closed
+out rather than deleted (§14).
+
+### 7. Still to measure
+
+- Config B at full n, for a real σ̂ and §7's derived thresholds (§15 item 4).
 - Judge-vs-human agreement over 30 hand labels → `docs/eval/agreement.md`
   (blocked on a human labelling session).
 - The gate demonstrated red on v5 and green on the revert.
 - `docs/img/quality_prompt_version.png`, once v4 and v5 traffic exists.
+
+---
+
+## 13. The baseline, and what run 3 actually measured
+
+Run 3 is the checked-in baseline: the 25-example CI subset at
+`d0abc4a` — prompt `v4`, corpus `2026-08-27-pinned`, dataset `v1`, model alias
+`fast`, judge `claude-sonnet-5`, seed 7, `max_steps=8`, sequential.
+
+| metric | run 3 | gated |
+|---|---:|---|
+| `faithfulness_mean` | **3.4400** | yes, −0.30 |
+| `hit_at_5_rate` | **0.6667** (16/24 answerable) | yes, −0.10 |
+| `citation_ok_rate` | **1.0000** (25/25) | yes, any drop |
+| `answer_quality_mean` | 4.6400 | no |
+| `hit_at_5_given_search` | 0.6667 | no |
+| `mean_cost_usd` | $0.0470 | no |
+| p50 / p95 latency | 8.51 s / 18.79 s | no |
+| `length_r_quality` | +0.0677 | no |
+| `length_r_faithfulness` | −0.1928 | no |
+| failures / judge parse failures | 0 / 0 | — |
+| total | $1.1751, 6.5 min wall | — |
+
+Four things in that table are worth saying out loud.
+
+**`hit_at_5_rate` = 0.6667 is much worse than `make eval-ab`'s 0.8659**, and
+they are not in conflict — they measure different things. The A/B issues one
+retrieval per question with the golden question verbatim. The agent writes its
+own query, from a system prompt, mid-conversation. The 0.20 gap between them is
+**the agent's query formulation**, isolated: retrieval that works answers worse
+questions than the ones the golden set asks. That is the single most actionable
+number the run produced, and it was invisible until both existed.
+
+**`hit_at_5_given_search` equals `hit_at_5_rate` exactly**, which says
+`search_rate` was 1.0 — v4 searched on all 24 answerable examples, so §6's
+`None`-vs-`False` distinction did not fire once here. It is still load-bearing:
+it is the whole mechanism by which v5 will read as *stopped searching* rather
+than as *retrieval regressed*.
+
+**`faithfulness_mean` = 3.44 against `answer_quality_mean` = 4.64** is the
+two-call split earning its cost. The answers are good against the reference and
+markedly less well *grounded in the chunks the agent was shown*. A single-call
+judge holding both contexts could not have produced that gap, and a
+single-number "quality" score would have reported 4.64 and nothing else.
+
+**`length_r_faithfulness` = −0.1928** is inside §5's ±0.22 CI at n=75 and this
+is n=25, so it is noise and is reported as such. It is *not* evidence the judge
+resists length; it is an absence of evidence either way.
+
+### The baseline rests on ONE run, and the file says so
+
+§7's threshold math is a two-observation estimator. Run 4 aborted (§14), so
+there is no second observation and **no σ̂ at all**. Two options: spend another
+$1.20 for a second run, or write a baseline that admits what it is. The second,
+because the ledger has $2.24 left and the *gate* is worth more now than σ̂ is.
+
+`Baseline.from_single()` therefore writes `sigma: {}` — empty, not zero,
+because zero reads as *measured no variance* when the truth is *measured
+nothing* — sets `threshold_source: "declared (no sigma measured)"`, and takes
+its thresholds from `eval.gate.DECLARED_THRESHOLDS`:
+
+| metric | declared | §7's two-run floor | ratio |
+|---|---:|---:|---:|
+| `faithfulness_mean` | 0.30 | 0.20 | 1.5× |
+| `hit_at_5_rate` | 0.10 | 0.08 | 1.25× |
+| `citation_ok_rate` | 0.00 (any drop) | not gated | — |
+
+Wider on purpose. A threshold with no measured noise behind it should be the
+*conservative* one: a false red on an ungated-until-now metric burns trust in
+the gate, and §7's rule that a too-noisy harness needs more examples rather
+than more tolerance cannot even be evaluated without σ̂. In judge points, 0.30
+at n=25 is 7.5 single-point flips; 0.10 on hit@5 is 2.4 of 24 answerable
+examples.
+
+**`citation_ok_rate` is gated here even though §6 calls it a smoke detector**,
+and that is not a reversal. The gate is on the *delta*, at zero tolerance,
+against a measured 1.0000. Gating "≥ 0.8" would be believing the number;
+gating "must not fall below where it has always been" is believing only that
+25/25 → anything less is worth stopping for. It is the cheapest available
+detector for a prompt that stops asking for citations, which is exactly what
+v5 does.
+
+### Building it without spending anything
+
+`python -m eval baseline --from-runs 3` (`make eval-baseline-from RUNS=3`)
+reads `eval_results` back and writes `eval/baseline.json`. It costs nothing,
+because those rows were already paid for — `make eval-baseline` produces two
+summaries *in memory* that are also rows in Postgres, and re-running it to
+recompute stored numbers would be paying twice for one measurement. One id
+gives the single-run baseline; two give the σ-derived one. **More than two is
+refused rather than averaged**, because `sigma_from_two` is exactly a
+two-observation estimator and quietly generalising it would make the file's
+own threshold math a lie.
+
+It refuses a run with `failures > 0` or no `finished_at`: an incomplete run
+measures the harness, not the agent.
+
+### `make eval-gate` — gating a run that already happened
+
+`python -m eval gate --run <id|latest>` compares a stored run against
+`eval/baseline.json`. Free, for the same reason: it reads rows rather than
+producing them, so re-checking a threshold costs nothing where re-running costs
+~$1. It exists separately from `run --gate` because **a run that aborted never
+reaches the in-process gate**, and its paid-for rows would otherwise be
+ungradeable — which is precisely run 4.
+
+Exit codes are the same four `run --gate` uses: 0 pass, 1 regression *or*
+config drift, 2 cannot compare, 3 harness failure. Those survive the module and
+**not** the `make` target — `make` exits 2 for any failed recipe, which would
+collapse "regression" and "harness failure" into one number, so CI calls the
+module directly.
+
+Run 4 through it is the drift guard working:
+
+```
+$ make eval-gate RUN=4
+  CONFIG DRIFT -- these runs are not comparable:
+    n: baseline 25 != run 17
+```
+
+`n` is in `PINNED` for exactly this case. Forced through with
+`--allow-config-drift`, run 4 reports `hit_at_5_rate` **0.8125** against the
+baseline's 0.6667 — a +0.146 "improvement" that is nothing of the kind. It is
+the first 17 of the same 25 questions, and the 8 it never reached are not a
+random 8. A gate that had reported that as a win is the failure mode `PINNED`
+exists to prevent, demonstrated rather than asserted.
+
+---
+
+## 14. Two incidents, and what they cost
+
+### The flat 60 s timeout — $0.63 and a baseline
+
+`HttpGatewayClient` was constructed with `timeout=60.0`: httpx applies a flat
+value to **all four** phases — connect, read, write, pool. 60 s is generous for
+a connect and short for a *read* on a multi-step agent turn whose final answer
+is several hundred tokens. Run 4 died on example 18 of 25 with an
+`httpx.ReadTimeout`, mid-generation.
+
+```python
+# before                                    # after
+timeout: float = 60.0                       DEFAULT_TIMEOUT = httpx.Timeout(
+                                                connect=10.0, read=180.0,
+                                                write=10.0, pool=10.0)
+```
+
+Per-phase, not one number, and the asymmetry is the point: `read` is the only
+phase where a legitimate wait is long, and the other three stay *shorter* than
+before, because a gateway that has not accepted a TCP connection in 10 s is
+down rather than slow and waiting 180 s to learn that helps nobody. One line,
+no retry logic — the second incident below is why a retry is not the fix
+here.
+
+The measurement, not just the diagnosis: run 3's p95 latency was **18.8 s**,
+comfortably inside 60. The p95 of a *turn* is not the p95 of a single gateway
+call under a long final generation, and 60 s looked safe right up until it was
+not. `services/agent`'s production tool timeout (15 s) is unchanged and
+unrelated — that is the MCP subprocess, not the gateway.
+
+### The $0.63 lost to a missing resume path
+
+The harness commits **per example** (`PostgresSink` in `eval/db.py`), specifically so a crash costs the example in flight and
+nothing else. It does. All 17 of run 4's rows were in Postgres, intact,
+including judge scores — and `UPSERT_RESULT` exists precisely to make a resume
+free rather than a duplicate-generator.
+
+**And there is no `--resume` flag to use it.** The infrastructure for
+resumption was built and the entry point was not. So $0.63 of paid-for,
+correctly-stored measurement sat in a table that nothing could continue from,
+and `make eval-baseline`'s only offer was to start over at $1.20.
+
+Two things were done rather than one:
+
+1. **`--from-runs`** turns those stored rows into a baseline without re-running
+   anything. It is what made the 17 rows *worth something*, and it is why
+   `eval/baseline.json` exists today instead of after another $1.20.
+2. **Run 4 was closed out by hand** — `finished_at` set, `total_cost_usd` set
+   to the $0.630032 its rows actually sum to, and a note recording the abort.
+   It is not deleted. The rows are real, the money was really spent, and a run
+   that vanishes from `eval_runs` takes its cost with it out of the ledger's
+   reach. `LATEST_RUN` and the gate both key on `finished_at IS NOT NULL`, so
+   an abort left open is invisible to every downstream reader — which is a
+   worse lie than an abort recorded as one.
+
+The general lesson, and it is not "add retries": **a durability mechanism with
+no entry point is not durability.** Per-result commits and an upsert are
+necessary for resumption and not sufficient for it, and the gap between them
+was invisible until a run actually died. `--resume` proper is §15's first item.
+
+---
+
+## 15. Extensions, in the order they are worth doing
+
+1. **`--resume <run_id>`.** The storage layer already supports it exactly
+   (§14). What is missing is a flag that reads the run's config back, subtracts
+   the `golden_example_id`s already present, and continues — plus a refusal
+   when the run's `git_sha`, prompt version or corpus version no longer match,
+   because resuming into a changed configuration produces a run that is two
+   configurations wearing one id.
+2. **Retry with backoff on the gateway client.** `eval/harness.py` retries
+   429/5xx already; a `ReadTimeout` is neither and propagates. It is listed
+   *after* resume deliberately: a retry that re-runs a 3-minute generation
+   costs money, and resumption makes the failure cheap whether or not the retry
+   lands. `services/agent`'s no-retry posture (ADR-003 §2) stays — the harness
+   owns retry policy.
+3. **Fixture tests for the gate.** `eval/gate.py` ships with none. It needs
+   table-driven cases over `metrics_from_rows` and `check()`: a clean pass, a
+   faithfulness drop at −0.31 and at −0.29, a single-point `citation_ok` drop,
+   a config drift on each `PINNED` key, and a run with `failures > 0` exiting 3
+   rather than 1. All of them are pure-function tests over dict rows, so they
+   need no database — the same standard as the rest of `eval/`.
+4. **Config B at full n.** Re-run the 25 to completion now the timeout is
+   fixed, then `--from-runs 3 <new>` for a genuine σ̂ and §7's derived
+   thresholds. ~$1.20 of the $2.24 remaining. Until then the gate's thresholds
+   are declared, and §13 says so.
+5. **Wire `eval-gate` into CI.** The `eval-gate` job runs `make eval-ci`, which
+   both produces and gates a run. Splitting those — run, then gate the stored
+   run by id — makes a CI failure re-inspectable without re-spending, and lets
+   a human re-gate the same rows after a threshold change. Needs the fixture
+   tests first: a gate wired into CI before it is tested is a gate that fails
+   builds for reasons nobody can reproduce.
+
+Still deferred, and unchanged from §11: the full 85-example run, judge-vs-human
+agreement (blocked on a human labelling session), and true blind pairwise A/B.

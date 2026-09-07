@@ -117,6 +117,7 @@ prompt, or tool your money is actually going to.
 | [services/rag](services/rag) | Hybrid retrieval — dense plus BM25 fused with RRF — over pinned Kafka, Flink and Iceberg docs |
 | [stream/clickhouse](stream/clickhouse) | Hot path: Kafka engine into a 7-day table, plus a dead-letter table |
 | [stream/flink](stream/flink) | Cold path: Flink SQL into Iceberg, hidden-partitioned by day |
+| [eval/](eval) | 85 golden examples, a two-call LLM judge, and a regression gate whose thresholds are measured rather than chosen |
 | [dashboards/](dashboards) | Both Grafana dashboards and their datasource, provisioned from files |
 
 ## Architecture
@@ -275,28 +276,92 @@ Every non-obvious choice is written down, with what it cost as well as what it b
 | [ADR-005](docs/adr/ADR-005-hot-path-clickhouse-grafana.md) | Why the ClickHouse Kafka engine instead of Kafka Connect, and why every count uses `uniqExact(span_id)` |
 | [ADR-006](docs/adr/ADR-006-analytics-layer.md) | Why Trino shares Flink's catalog rather than opening a second one, why staging models are tables, and where the exact p95 finally lives |
 | [ADR-007](docs/adr/ADR-007-cdc-metadata.md) | Why CDC instead of dual-writing, why the changelog lands through a batch pull rather than a third Flink job, and what a replication slot retains while nobody is reading it |
+| [ADR-008](docs/adr/ADR-008-eval-harness.md) | Why the judge is two calls rather than one, why a threshold with no measured σ is deliberately wider, and the $0.63 a missing resume path cost |
 
-## Status and roadmap
+## Status
 
 Built and verified: the telemetry SDK, the inference gateway, the RAG corpus and hybrid
 retrieval, the MCP server and the bounded agent loop, the Flink to Iceberg cold path,
 the ClickHouse and Grafana hot path, the Trino/dbt/Great Expectations analytics layer
-with OpenLineage lineage, Debezium CDC from a Postgres metadata database, and CI (lint,
-tests, a schema-compatibility gate that runs when `contracts/` changes, and a quality
-gate that runs the analytics slice for real).
+with OpenLineage lineage, Debezium CDC from a Postgres metadata database, the eval
+harness and its regression gate, and CI (lint, tests, a schema-compatibility gate that
+runs when `contracts/` changes, and a quality gate that runs the analytics slice for
+real).
 
-Next:
+## Evaluating the agent
 
-- **An eval harness with quality gates in CI.** The metadata tables it writes —
-  `prompt_versions`, `golden_examples`, `eval_runs`, `eval_results` — exist and are
-  already streaming into the lake ([ADR-007](docs/adr/ADR-007-cdc-metadata.md)); the
-  harness that fills them is the gap.
+Traces say what the agent *did*. `eval/` asks whether the answers were any **good**, and
+writes its verdict into the same metadata database everything else streams out of — so
+`eval_runs` and `eval_results` reach the lake through the CDC pipeline that was already
+there ([ADR-007](docs/adr/ADR-007-cdc-metadata.md)), with no new configuration.
+
+**85 golden examples**, stratified across project (Kafka/Flink/Iceberg), type
+(factual/conceptual/config) and difficulty, with 3 deliberately unanswerable ones and a
+fixed 25-example CI subset. Every `expected_source` is checked against the live corpus,
+because a prefix that matches nothing scores hit@5 = 0 forever and reads as a retrieval
+regression rather than as the typo it is.
+
+**A two-call judge.** Faithfulness grades the answer against the *retrieved chunks* and
+never sees the reference; answer quality grades it against the *reference* and never
+sees the chunks. One call would mean one context holding both, and a model cannot unsee
+either. Position is randomised and recorded, the judge is blinded to prompt version and
+model, and an unparseable reply becomes `NULL` — never a default score, because a
+fabricated 3 is indistinguishable from a real one.
+
+**Deterministic metrics and judged metrics are kept apart**, because they fail
+differently. `hit@5` and `citation_ok` are arithmetic over what the agent retrieved and
+said — reproducible from stored rows, no model involved. `faithfulness` and
+`answer_quality` are a nondeterministic model's opinion, which is why thresholds are
+*measured* from repeat runs rather than chosen.
+
+What the current baseline measured — run 3, the 25-example CI subset at prompt `v4`:
+
+| | |
+|---|---:|
+| `faithfulness_mean` | 3.4400 |
+| `answer_quality_mean` | 4.6400 |
+| `hit_at_5_rate` | 0.6667 |
+| `citation_ok_rate` | 1.0000 |
+| cost / wall | $1.18, 6.5 min |
+
+`hit@5` is 0.6667 here against **0.8659** for the same corpus in the retrieval-only A/B
+([docs/eval/retrieval_ab.md](docs/eval/retrieval_ab.md)). They do not disagree: the A/B
+asks the golden question verbatim, the agent writes its own query. That 0.20 gap *is*
+the agent's query formulation, isolated — the most actionable number the run produced,
+and invisible until both existed.
+
+```bash
+make eval-validate            # free -- stratification, tags, every source resolves
+make eval-ab                  # free -- retrieval A/B over all 85; needs only Qdrant
+make eval-gate RUN=3          # free -- gate a stored run against eval/baseline.json
+make eval-ledger              # what has been spent, and what is left
+
+make eval-pilot               # SPENDS -- 3 examples, to measure per-example cost first
+make eval-ci                  # SPENDS -- the 25-example subset, gated
+```
+
+Every spending command prints an estimate, refuses to start if the ledger says it cannot
+finish inside the cap, and re-checks after each example. The gate is one-sided — only a
+regression fails, and an improvement is reported rather than adopted, because a gate that
+ratchets itself up on a lucky run cannot tell a gain from noise. Config drift (a
+different prompt version, corpus, dataset or `n`) fails on a *different* exit code from a
+quality regression: reporting the first as the second sends someone hunting a regression
+that is not there.
+
+The full story, including the two incidents that cost real money, is
+[ADR-008](docs/adr/ADR-008-eval-harness.md).
+
+## Roadmap
+
+- **`--resume` for an interrupted eval run.** Results commit per example and the upsert
+  is already there; the entry point that would use them is not, which cost $0.63 when a
+  baseline run timed out 17 examples in.
+- **A second full baseline run**, for a real σ̂ and derived thresholds. Today's are
+  hand-set and wider, and `eval/baseline.json` records which of the two it is.
 - **Landing the other three CDC topics.** The connector captures all four metadata
   tables, but only `prompt_versions` is landed and modelled — the rest is a copy of
   `scripts/cdc_land.py`, not a design.
 - **Terraform** for the deployed footprint.
-
-The empty `eval/` and `infra/` directories are placeholders for exactly these.
 
 ## Running it on a small machine
 

@@ -33,8 +33,18 @@ class GatewayClient(Protocol):
     ) -> ChatResponse: ...
 
 
+#: Per-phase, not one flat number. A flat 60s timed out mid-generation on the
+#: long answers the eval harness asks for and killed a baseline run 17 examples
+#: in (ADR-008 #14) -- so `read` is the generous one, and the other three stay
+#: short because a gateway that has not accepted a TCP connection in 10s is
+#: down, not slow, and waiting 180s to learn that helps nobody.
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+
+
 class HttpGatewayClient:
-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self, base_url: str | None = None, *, timeout: httpx.Timeout | float = DEFAULT_TIMEOUT
+    ) -> None:
         self._base_url = (
             base_url or os.environ.get("AGENTLAKE_GATEWAY", DEFAULT_GATEWAY_URL)
         ).rstrip("/")

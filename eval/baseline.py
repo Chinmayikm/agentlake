@@ -41,6 +41,14 @@ the size of the floor. That does not apply here, because the SAME 25 questions
 run every time; there is no resampling. The only run-to-run variance is the
 agent's and the judge's nondeterminism (no temperature is set; both sample at
 provider defaults), and that is exactly what the two baseline runs measure.
+
+## The one-run case, which is what is actually checked in
+
+`from_single()` exists because the second baseline run aborted at 17 of 25
+(ADR-008 #14) and re-running it costs ~$1.20. It writes `sigma: {}` -- empty,
+not zero -- and takes its thresholds from `eval.gate.DECLARED_THRESHOLDS`
+instead. Everything above about sigma applies to a two-run baseline and to
+nothing else; the file records which of the two it is in `threshold_source`.
 """
 
 from __future__ import annotations
@@ -105,6 +113,39 @@ class Baseline:
     notes: str = ""
 
     @classmethod
+    def from_single(
+        cls, run: dict[str, float | None], config: dict[str, Any], *, notes: str = ""
+    ) -> Baseline:
+        """A baseline resting on ONE run, with NO measured sigma.
+
+        This is weaker than `from_runs` and the file says so rather than
+        looking identical to a two-run baseline. `sigma` is written empty --
+        not zero, because zero would read as "measured no variance" when the
+        truth is "measured nothing" -- and the thresholds come from
+        `eval.gate.DECLARED_THRESHOLDS`, which are hand-set and wider.
+
+        It exists because run 4 aborted at 17 of 25 (ADR-008 #14). The choice
+        was a one-run baseline that admits what it is, or another $1.20 to
+        re-measure sigma. The gate is more useful now than in a week.
+        """
+        from eval.gate import DECLARED_THRESHOLDS
+
+        return cls(
+            config=config,
+            runs=[run],
+            metrics=dict(run),
+            sigma={},
+            thresholds=dict(DECLARED_THRESHOLDS),
+            notes=notes
+            or (
+                "Single-run baseline: no sigma was measured, so the thresholds are "
+                "hand-set (eval.gate.DECLARED_THRESHOLDS) and deliberately wider "
+                "than the two-run floors. Replace with `make eval-baseline` when "
+                "there is budget for two runs."
+            ),
+        )
+
+    @classmethod
     def from_runs(
         cls, run_a: dict[str, float | None], run_b: dict[str, float | None], config: dict[str, Any]
     ) -> Baseline:
@@ -156,6 +197,11 @@ class Baseline:
 
 
 def _asdict(baseline: Baseline) -> dict[str, Any]:
+    # `gated` and `derived_from` are read off the instance, not off the module
+    # constants: a single-run baseline gates a different metric set with
+    # hand-set thresholds, and writing GATED/FLOORS unconditionally would make
+    # the file claim a calibration it does not have.
+    measured = bool(baseline.sigma)
     return {
         "schema": baseline.schema,
         "config": baseline.config,
@@ -163,8 +209,9 @@ def _asdict(baseline: Baseline) -> dict[str, Any]:
         "metrics": baseline.metrics,
         "sigma": baseline.sigma,
         "thresholds": baseline.thresholds,
-        "gated": list(GATED),
-        "floors": FLOORS,
+        "gated": sorted(baseline.thresholds),
+        "threshold_source": "max(2*sigma, floor)" if measured else "declared (no sigma measured)",
+        "floors": FLOORS if measured else None,
         "notes": baseline.notes,
     }
 

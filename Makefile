@@ -1,6 +1,7 @@
 .PHONY: test lint gateway traces rag-preflight prompts-load prompts-load-dry \
         eval-validate eval-corpus-paths eval-ab eval-load eval-pilot eval \
-        eval-ci eval-baseline eval-label eval-agreement eval-ledger \
+        eval-ci eval-baseline eval-baseline-from eval-gate eval-label \
+        eval-agreement eval-ledger \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -111,6 +112,27 @@ eval-baseline:
 	.venv/bin/python3 -m eval baseline --subset ci --yes
 
 # Free again from here.
+#
+# Rebuild eval/baseline.json from runs ALREADY in the metadata database, with
+# no API calls at all: make eval-baseline-from RUNS="3 4". One run id gives a
+# single-run baseline with declared thresholds, two give the sigma-derived
+# ones. This is how the checked-in baseline was made -- run 4 aborted, so
+# re-running for sigma would have cost another $1.20 (ADR-008 #14).
+eval-baseline-from:
+	.venv/bin/python3 -m eval baseline --from-runs $(RUNS)
+
+# Gate a run that already happened against eval/baseline.json. Free -- it reads
+# eval_results, it does not produce them, so re-checking a threshold costs
+# nothing where re-running would cost ~$1. Defaults to the latest finished run;
+# `make eval-gate RUN=3` picks one.
+#   exit 0 pass  |  1 regression or config drift  |  2 cannot compare  |  3 harness failure
+#
+# Those four codes survive the module, NOT this target: make exits 2 for any
+# failed recipe, which would collapse "regression" and "harness failure" into
+# one number. CI calls `python -m eval gate` directly for that reason.
+eval-gate:
+	.venv/bin/python3 -m eval gate --run $(or $(RUN),latest)
+
 #
 # Emit a stratified 30-row hand-labelling sheet from the most recent completed
 # run. The judge's own score is deliberately absent from it.
