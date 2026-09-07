@@ -1,0 +1,399 @@
+# Golden examples for the pinned Iceberg 1.7 corpus.
+#
+# Pinned documents (services/rag/sources.yaml): ten files under docs/docs/ --
+# schemas, evolution, partitioning, branching, reliability, configuration,
+# spark-configuration, flink-configuration, maintenance, metrics-reporting.
+#
+# AUTHORING RULE (ADR-008): every question was written FROM the file named in
+# `written_from`, before retrieval was run against it.
+
+dataset_version: v1
+project: iceberg
+
+examples:
+  # --- schema and partition evolution --------------------------------------
+  - key: iceberg-evolution-001
+    question: "If I add a column to an Iceberg table, do the existing data files have to be rewritten?"
+    expected_answer: >
+      No. Iceberg schema updates -- add, drop, rename, type widening, and
+      reordering -- are metadata changes only, so no data files are rewritten.
+    expected_sources: [docs/docs/evolution.md]
+    written_from: "docs/docs/evolution.md#Schema evolution"
+    difficulty: easy
+    type: conceptual
+    ci: true
+
+  - key: iceberg-evolution-002
+    question: "Why is renaming a column safe in Iceberg when it can cause wrong results in other table formats?"
+    expected_answer: >
+      Iceberg tracks every column by a unique ID that is never reused, so a name
+      is just a label. Formats that track columns by name can un-delete a column
+      when a name is reused; formats that track by position cannot drop a column
+      without shifting the names of the others. The ID indirection avoids both.
+    expected_sources: [docs/docs/evolution.md]
+    written_from: "docs/docs/evolution.md#Schema evolution > Correctness"
+    difficulty: hard
+    type: conceptual
+
+  - key: iceberg-evolution-003
+    question: "Our table is partitioned by day and we want to move to hourly. Do we need a new table?"
+    expected_answer: >
+      No -- Iceberg supports partition evolution in place. Data already written
+      keeps its old spec, new data is written with the new one, and metadata for
+      each spec is kept separately, so queries use split planning and plan each
+      layout with its own derived filter. The change is metadata-only and does
+      not eagerly rewrite files.
+    expected_sources: [docs/docs/evolution.md]
+    written_from: "docs/docs/evolution.md#Partition evolution"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-evolution-004
+    question: "Which Java API call changes a table's partition spec?"
+    expected_answer: >
+      Table.updateSpec(), chaining addField()/removeField() and then commit() --
+      for example updateSpec().addField(bucket("id", 8)).removeField("category")
+      .commit(). Spark can do the same through ALTER TABLE.
+    expected_sources: [docs/docs/evolution.md]
+    written_from: "docs/docs/evolution.md#Partition evolution"
+    difficulty: medium
+    type: factual
+
+  - key: iceberg-evolution-005
+    question: "Can I change the sort order of an existing Iceberg table, and what happens to data already written?"
+    expected_answer: >
+      Yes, via replaceSortOrder() (or ALTER TABLE in Spark). Data written under
+      the earlier order is left unchanged, and engines may write in the latest
+      order or unsorted when sorting would be too expensive.
+    expected_sources: [docs/docs/evolution.md]
+    written_from: "docs/docs/evolution.md#Sort order evolution"
+    difficulty: medium
+    type: factual
+
+  # --- partitioning --------------------------------------------------------
+  - key: iceberg-partitioning-001
+    question: "What is hidden partitioning and how is it different from Hive-style partitioning?"
+    expected_answer: >
+      Iceberg derives partition values itself from a column plus an optional
+      transform -- a logs table is partitioned by day(event_time), not by a
+      separate event_date column -- and records that relationship. Hive requires
+      an explicit partition column that the writer must populate and the reader
+      must filter on. Because Iceberg keeps the relationship, producers and
+      consumers never see the partition column and queries do not depend on the
+      physical layout.
+    expected_sources: [docs/docs/partitioning.md]
+    written_from: "docs/docs/partitioning.md#Iceberg's hidden partitioning"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-partitioning-002
+    question: "In Hive, what goes wrong if a query filters on event_time but not event_date?"
+    expected_answer: >
+      Hive scans every file in the table, because it does not know event_date
+      was derived from event_time. The related failure is worse: a writer
+      supplying the wrong format or the wrong source column produces silently
+      incorrect results rather than an error, since Hive cannot validate
+      partition values.
+    expected_sources: [docs/docs/partitioning.md]
+    written_from: "docs/docs/partitioning.md#Partitioning in Hive"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-partitioning-003
+    question: "What time granularities can Iceberg partition a timestamp column by?"
+    expected_answer: "Year, month, day, and hour."
+    expected_sources: [docs/docs/partitioning.md]
+    written_from: "docs/docs/partitioning.md#What is partitioning?"
+    difficulty: easy
+    type: factual
+    ci: true
+
+  # --- reliability ---------------------------------------------------------
+  - key: iceberg-reliability-001
+    question: "What makes an Iceberg commit atomic?"
+    expected_answer: >
+      Valid snapshots and a pointer to the current one live in the table
+      metadata file, and a commit replaces the path of that current metadata
+      file with a single atomic operation. That makes every data and metadata
+      update atomic and is the basis for serializable isolation.
+    expected_sources: [docs/docs/reliability.md]
+    written_from: "docs/docs/reliability.md#Reliability"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-reliability-002
+    question: "What happens when two writers commit to the same Iceberg table at the same time?"
+    expected_answer: >
+      Iceberg uses optimistic concurrency. Each writer assumes it is alone,
+      writes new table metadata, and tries to swap it in atomically. If the swap
+      fails because someone else committed first, the loser retries by building
+      a new metadata tree on top of the new current state.
+    expected_sources: [docs/docs/reliability.md]
+    written_from: "docs/docs/reliability.md#Concurrent write operations"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-reliability-003
+    question: "After a commit conflict, how does Iceberg decide whether it is safe to retry rather than fail?"
+    expected_answer: >
+      Commits are structured as assumptions plus actions. After a conflict the
+      writer re-checks its assumptions against the new table state; if they
+      still hold, the actions can be re-applied. A compaction rewriting
+      file_a.avro and file_b.avro into merged.parquet is safe only while the
+      table still contains both source files -- if a conflicting commit removed
+      either, the operation must fail.
+    expected_sources: [docs/docs/reliability.md]
+    written_from: "docs/docs/reliability.md#Concurrent write operations > Retry validation"
+    difficulty: hard
+    type: conceptual
+    ci: true
+
+  - key: iceberg-reliability-004
+    question: "Why is planning an Iceberg scan cheaper than planning a Hive scan?"
+    expected_answer: >
+      Hive reconstructs table state by listing directories, which is O(n) in the
+      number of partitions and depends on consistent listing. Iceberg tracks the
+      complete file list in each snapshot as a persistent tree, so reading a
+      snapshot takes O(1) RPC calls, planning can be distributed to the jobs,
+      and the metastore stops being a bottleneck.
+    expected_sources: [docs/docs/reliability.md]
+    written_from: "docs/docs/reliability.md#Reliability"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-reliability-005
+    question: "Does Iceberg need an object store with consistent listing?"
+    expected_answer: >
+      No. Iceberg avoids file listing and rename operations altogether, which is
+      what makes it compatible with any object store -- and was the original
+      correctness problem it was built to solve for Hive tables on S3.
+    expected_sources: [docs/docs/reliability.md]
+    written_from: "docs/docs/reliability.md#Compatibility"
+    difficulty: medium
+    type: factual
+
+  # --- schemas -------------------------------------------------------------
+  - key: iceberg-schemas-001
+    question: "Which numeric type promotions does Iceberg allow?"
+    expected_answer: "int can be promoted to long, and float to double."
+    expected_sources: [docs/docs/schemas.md]
+    written_from: "docs/docs/schemas.md#Schemas"
+    difficulty: easy
+    type: factual
+
+  - key: iceberg-schemas-002
+    question: "What is the maximum precision of an Iceberg decimal column, and can the scale be changed later?"
+    expected_answer: >
+      Precision must be 38 or less, and the scale is fixed -- it cannot be
+      changed after the column is created.
+    expected_sources: [docs/docs/schemas.md]
+    written_from: "docs/docs/schemas.md#Schemas"
+    difficulty: medium
+    type: factual
+
+  - key: iceberg-schemas-003
+    question: "At what resolution does Iceberg store timestamp and time values?"
+    expected_answer: >
+      Microseconds -- for time, timestamp (without timezone) and timestamptz
+      alike.
+    expected_sources: [docs/docs/schemas.md]
+    written_from: "docs/docs/schemas.md#Schemas"
+    difficulty: easy
+    type: factual
+
+  # --- maintenance ---------------------------------------------------------
+  - key: iceberg-maintenance-001
+    question: "Why should I expire Iceberg snapshots regularly, and what do I lose by doing it?"
+    expected_answer: >
+      Every write creates a snapshot and they accumulate, growing table
+      metadata and pinning data files -- a data file is only deleted once no
+      snapshot that could be used for time travel or rollback still references
+      it. Expiring removes those snapshots from metadata and deletes the unused
+      files; the cost is that you can no longer time-travel to or roll back to
+      the expired snapshots.
+    expected_sources: [docs/docs/maintenance.md]
+    written_from: "docs/docs/maintenance.md#Recommended Maintenance > Expire Snapshots"
+    difficulty: medium
+    type: conceptual
+
+  - key: iceberg-maintenance-002
+    question: "A streaming job commits constantly and metadata JSON files are piling up. Which table properties clean them?"
+    expected_answer: >
+      write.metadata.delete-after-commit.enabled=true turns on cleanup of old
+      tracked metadata files after each commit, and
+      write.metadata.previous-versions-max sets how many to keep.
+    expected_sources: [docs/docs/maintenance.md]
+    written_from: "docs/docs/maintenance.md#Recommended Maintenance > Remove old metadata files"
+    difficulty: medium
+    type: config
+
+  - key: iceberg-maintenance-003
+    question: "I enabled write.metadata.delete-after-commit.enabled. Will that clear out every old metadata file?"
+    expected_answer: >
+      No -- it only deletes metadata files that are tracked in the metadata log.
+      Orphaned metadata files are left behind. The docs give the example of 100
+      commits with the setting off and previous-versions-max=10 leaving 10
+      tracked files and 90 orphaned ones, which enabling it later will not
+      remove.
+    expected_sources: [docs/docs/maintenance.md]
+    written_from: "docs/docs/maintenance.md#Recommended Maintenance > Remove old metadata files"
+    difficulty: hard
+    type: config
+
+  - key: iceberg-maintenance-004
+    question: "Where do orphan files come from in an Iceberg table, and how do I get rid of them?"
+    expected_answer: >
+      Task or job failures in Spark and similar engines can leave files that no
+      table metadata references, and normal snapshot expiration cannot always
+      tell such a file is unneeded. The deleteOrphanFiles action cleans them up
+      under the table location.
+    expected_sources: [docs/docs/maintenance.md]
+    written_from: "docs/docs/maintenance.md#Recommended Maintenance > Delete orphan files"
+    difficulty: medium
+    type: factual
+    ci: true
+
+  # --- table configuration -------------------------------------------------
+  - key: iceberg-config-001
+    question: "What is the default target file size for Iceberg writes?"
+    expected_answer: >
+      write.target-file-size-bytes defaults to 536870912 bytes -- 512 MB.
+    expected_sources: [docs/docs/configuration.md]
+    written_from: "docs/docs/configuration.md#Write properties"
+    difficulty: easy
+    type: config
+    ci: true
+
+  - key: iceberg-config-002
+    question: "Which compression codec does Iceberg use for Parquet by default, and what else can I pick?"
+    expected_answer: >
+      write.parquet.compression-codec defaults to zstd; the alternatives are
+      brotli, lz4, gzip, snappy and uncompressed.
+    expected_sources: [docs/docs/configuration.md]
+    written_from: "docs/docs/configuration.md#Write properties"
+    difficulty: easy
+    type: config
+
+  - key: iceberg-config-003
+    question: "How many times does Iceberg retry a failed commit before giving up?"
+    expected_answer: "commit.retry.num-retries defaults to 4."
+    expected_sources: [docs/docs/configuration.md]
+    written_from: "docs/docs/configuration.md#Table behavior properties"
+    difficulty: medium
+    type: config
+
+  - key: iceberg-config-004
+    question: "What does write.distribution-mode control and what are the options?"
+    expected_answer: >
+      How rows are distributed across tasks when writing: none does not shuffle,
+      hash distributes by partition key, and range distributes by partition key
+      or by the sort key if the table has a sort order. Defaults vary by engine.
+    expected_sources: [docs/docs/configuration.md]
+    written_from: "docs/docs/configuration.md#Write properties"
+    difficulty: hard
+    type: config
+
+  - key: iceberg-config-005
+    question: "What column statistics does Iceberg collect by default, and can I change it per column?"
+    expected_answer: >
+      write.metadata.metrics.default is truncate(16); the modes are none,
+      counts, truncate(length) and full. Per-column overrides are set with
+      write.metadata.metrics.column.<name>, and
+      write.metadata.metrics.max-inferred-column-defaults (100) caps how many
+      top-level columns get metrics by default.
+    expected_sources: [docs/docs/configuration.md]
+    written_from: "docs/docs/configuration.md#Write properties"
+    difficulty: hard
+    type: config
+
+  # --- flink integration ---------------------------------------------------
+  - key: iceberg-flink-001
+    question: "Which catalog types can the Flink Iceberg connector use?"
+    expected_answer: >
+      catalog-type accepts hive, hadoop, rest, glue, jdbc and nessie -- or it can
+      be left unset and catalog-impl given the fully-qualified class name of a
+      custom catalog implementation.
+    expected_sources: [docs/docs/flink-configuration.md]
+    written_from: "docs/docs/flink-configuration.md#Catalog Configuration"
+    difficulty: medium
+    type: config
+    ci: true
+
+  - key: iceberg-flink-002
+    question: "What does a Flink Iceberg source do by default when it starts a streaming read?"
+    expected_answer: >
+      starting-strategy defaults to INCREMENTAL_FROM_LATEST_SNAPSHOT: it begins
+      incremental reading from the latest snapshot inclusive, rather than
+      scanning the whole table first. TABLE_SCAN_THEN_INCREMENTAL is the option
+      that does a full scan before switching to incremental.
+    expected_sources: [docs/docs/flink-configuration.md]
+    written_from: "docs/docs/flink-configuration.md#Runtime configuration > Read options"
+    difficulty: hard
+    type: config
+
+  - key: iceberg-flink-003
+    question: "What is the default target split size when Flink reads an Iceberg table?"
+    expected_answer: >
+      128 MB -- the split-size read option, backed by the read.split.target-size
+      table property.
+    expected_sources: [docs/docs/flink-configuration.md]
+    written_from: "docs/docs/flink-configuration.md#Runtime configuration > Read options"
+    difficulty: medium
+    type: config
+
+  # --- branching and metrics ----------------------------------------------
+  - key: iceberg-branching-001
+    question: "How can I validate data quality before it becomes visible in the main table?"
+    expected_answer: >
+      Use an audit branch. Set write.wap.enabled=true, create a branch from the
+      current snapshot, write to it (spark.wap.branch), run validation against
+      the branch, then fast-forward main to the branch head with
+      system.fast_forward. Main is unaffected until the fast-forward.
+    expected_sources: [docs/docs/branching.md]
+    written_from: "docs/docs/branching.md#Use Cases > Audit Branch"
+    difficulty: hard
+    type: conceptual
+    ci: true
+
+  - key: iceberg-branching-002
+    question: "How do I keep a specific snapshot around for auditing for six months?"
+    expected_answer: >
+      Tag it with a retention period, e.g.
+      ALTER TABLE prod.db.table CREATE TAG `EOM-01` AS OF VERSION 30 RETAIN 180
+      DAYS. Tags are named references to snapshots with their own lifecycle, so
+      expireSnapshots will not remove a tagged snapshot before its retention
+      expires. The default retention for branches and tags is forever.
+    expected_sources: [docs/docs/branching.md]
+    written_from: "docs/docs/branching.md#Use Cases > Historical Tags"
+    difficulty: medium
+    type: factual
+
+  - key: iceberg-metrics-001
+    question: "What is the difference between Iceberg's ScanReport and CommitReport?"
+    expected_answer: >
+      A ScanReport carries metrics gathered during scan planning -- planning
+      duration, and counts of data and delete files and manifests scanned or
+      skipped. A CommitReport is produced after a commit creates a snapshot and
+      carries total duration, how many attempts the commit needed, and counts of
+      added and removed data and delete files.
+    expected_sources: [docs/docs/metrics-reporting.md]
+    written_from: "docs/docs/metrics-reporting.md#Type of Reports"
+    difficulty: medium
+    type: factual
+    ci: true
+
+  # --- deliberately unanswerable ------------------------------------------
+  # Iceberg's own docs contain no comparison against Delta Lake or Hudi; the
+  # pinned subset certainly does not. A model that answers this confidently is
+  # answering from pre-training, which is exactly what faithfulness scores down.
+  - key: iceberg-unanswerable-001
+    question: "How does Iceberg's performance compare to Delta Lake and Apache Hudi on merge-heavy workloads?"
+    expected_answer: >
+      The pinned corpus does not cover this. It contains Iceberg's own
+      documentation, which does not benchmark Iceberg against Delta Lake or
+      Hudi.
+    expected_sources: []
+    written_from: "(not in the corpus)"
+    answerable: false
+    difficulty: medium
+    type: conceptual

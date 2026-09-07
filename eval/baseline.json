@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "config": {
+    "git_sha": "d0abc4a8639f8d280cc6cad35b0e5cb0f7080dac",
+    "dataset_version": "v1",
+    "corpus_version": "2026-08-27-pinned",
+    "prompt_version": "v4",
+    "model_alias": "fast",
+    "max_steps": 8,
+    "judge_model": "claude-sonnet-5",
+    "judge_seed": 7,
+    "n": 25,
+    "run_ids": [
+      3
+    ]
+  },
+  "runs": [
+    {
+      "faithfulness_mean": 3.44,
+      "answer_quality_mean": 4.64,
+      "hit_at_5_rate": 0.6666666666666666,
+      "hit_at_5_given_search": 0.6666666666666666,
+      "search_rate": null,
+      "any_call_hit_rate": null,
+      "citation_ok_rate": 1.0,
+      "truncation_rate": null,
+      "mean_cost_usd": 0.04700272,
+      "p50_latency_ms": 8514.626538000812,
+      "p95_latency_ms": 18790.78173400012,
+      "length_r_quality": 0.06774402005482753,
+      "length_r_faithfulness": -0.19279232254585266
+    }
+  ],
+  "metrics": {
+    "faithfulness_mean": 3.44,
+    "answer_quality_mean": 4.64,
+    "hit_at_5_rate": 0.6666666666666666,
+    "hit_at_5_given_search": 0.6666666666666666,
+    "search_rate": null,
+    "any_call_hit_rate": null,
+    "citation_ok_rate": 1.0,
+    "truncation_rate": null,
+    "mean_cost_usd": 0.04700272,
+    "p50_latency_ms": 8514.626538000812,
+    "p95_latency_ms": 18790.78173400012,
+    "length_r_quality": 0.06774402005482753,
+    "length_r_faithfulness": -0.19279232254585266
+  },
+  "sigma": {},
+  "thresholds": {
+    "faithfulness_mean": 0.3,
+    "hit_at_5_rate": 0.1,
+    "citation_ok_rate": 0.0
+  },
+  "gated": [
+    "citation_ok_rate",
+    "faithfulness_mean",
+    "hit_at_5_rate"
+  ],
+  "threshold_source": "declared (no sigma measured)",
+  "floors": null,
+  "notes": "Single-run baseline: no sigma was measured, so the thresholds are hand-set (eval.gate.DECLARED_THRESHOLDS) and deliberately wider than the two-run floors. Replace with `make eval-baseline` when there is budget for two runs."
+}

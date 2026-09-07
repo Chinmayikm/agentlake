@@ -245,3 +245,52 @@ def test_there_are_dashboards_and_targets_to_check() -> None:
     into a no-op that still reports green."""
     assert DASHBOARDS
     assert _targets()
+
+
+# ---------------------------------------------------------------------------
+# The quality dashboard's prose has to keep up with what is actually wired
+# ---------------------------------------------------------------------------
+
+
+def test_no_panel_claims_a_populated_query_returns_nothing() -> None:
+    """The quality dashboard said its prompt-version panels "return no rows
+    because nothing in the agent sets that attribute yet" -- true when written,
+    false since ADR-007, and doubly false since ADR-008 made the prompt real.
+
+    Stale prose on a dashboard is worse than none: it tells a reader the panel
+    is broken when the panel is fine, and nothing fails when it drifts.
+    """
+    quality = _load(DASHBOARD_DIR / "quality.json")
+    prose = " ".join(
+        [quality.get("description", "")]
+        + [
+            panel.get("options", {}).get("content", "")
+            for panel in _panels(quality)
+            if panel.get("type") == "text"
+        ]
+    ).lower()
+
+    for claim in (
+        "return no rows",
+        "returns no rows",
+        "empty only because",
+        "does not exist yet",
+        "which does not exist",
+        "nothing sets a prompt_version",
+        "nothing in the agent sets that attribute yet",
+    ):
+        assert claim not in prose, f"stale dashboard prose: {claim!r}"
+
+
+def test_the_quality_dashboard_says_where_eval_scores_actually_live() -> None:
+    """They are rows in Postgres, not spans. A reader who cannot find them here
+    should be told why rather than left assuming the panel is unfinished."""
+    quality = _load(DASHBOARD_DIR / "quality.json")
+    prose = " ".join(
+        panel.get("options", {}).get("content", "")
+        for panel in _panels(quality)
+        if panel.get("type") == "text"
+    )
+
+    assert "eval_results" in prose
+    assert "docs/eval/" in prose

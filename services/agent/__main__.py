@@ -31,10 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt-version",
         default=DEFAULT_PROMPT_VERSION,
-        help="the prompt template version to attribute this turn to; it is "
-        "stamped on the AGENT_STEP span and sent to the gateway as "
-        "X-Prompt-Version so it reaches the LLM_CALL span too "
-        "(default: %(default)s, matching metadata/sql/07_seed.sql)",
+        help="which prompt to run. Its text is read from "
+        "services/agent/prompts/<version>.md and sent as the system prompt; the "
+        "version is also stamped on the AGENT_STEP span and sent to the gateway "
+        "as X-Prompt-Version so it reaches the LLM_CALL span too "
+        "(default: %(default)s). NOTE v5 is deliberately degraded -- it exists "
+        "to make the eval regression gate go red (ADR-008)",
     )
     return parser
 

@@ -15,7 +15,6 @@ from services.rag.fetch import (
     DEFAULT_RAW_DIR,
     DEFAULT_STRATEGIES,
     FetchStrategy,
-    load_corpus_version,
     load_sources,
 )
 from services.rag.retrieve import RetrievalMode
@@ -31,9 +30,9 @@ _PROGRESS_EVERY = 25
 
 
 def _default_store() -> Store:
-    from services.rag.qdrant_store import QdrantStore
+    from services.rag.qdrant_store import default_store
 
-    return QdrantStore(corpus_version=load_corpus_version())
+    return default_store()
 
 
 def _batched(items: list[Chunk], size: int) -> Iterator[list[Chunk]]:
@@ -153,6 +152,88 @@ def _retrieve(
         print()
 
 
+# Probe queries for `diagnose`. One per pinned project per retrieval strength:
+# an exact config key or identifier (BM25's home ground) and a paraphrase with
+# none of the document's literal vocabulary (dense's). A probe set that was all
+# one kind could not tell a dead dense index from a merely unhelpful one.
+DIAGNOSE_PROBES: tuple[str, ...] = (
+    "log.retention.hours",
+    "how does the broker decide when to throw away old records",
+    "taskmanager.memory.process.size",
+    "what stops a streaming job from losing progress when a machine dies",
+    "iceberg schema evolution",
+    "renaming a column without rewriting the data files",
+)
+
+
+def _diagnose(
+    *,
+    store: Store,
+    embedder: Embedder,
+    bm25_index: BM25Index,
+    k: int = 5,
+    probes: Sequence[str] = DIAGNOSE_PROBES,
+) -> int:
+    """Is dense retrieval alive, and is hybrid actually fusing anything?
+
+    Two questions, because for a long time the answers here were "no" and "no"
+    and nothing said so. `retrieve()`'s default store was built without a
+    `corpus_version`, which is a search filter, so dense returned zero rows for
+    every query -- and RRF over (empty, bm25) is bm25, so `mode="hybrid"` was
+    BM25-only and looked entirely healthy from the outside. See ADR-008 #1.
+
+    The fingerprint needs no labelled data, which is why it can run anywhere:
+    dense returning nothing for EVERY probe is not a bad index, it is no index;
+    and hybrid's top-k being byte-identical to bm25's for every probe means
+    fusion had nothing to fuse. Exits non-zero on either.
+    """
+    corpus_version = getattr(store, "corpus_version", "(n/a)")
+    print(f"corpus_version : {corpus_version}")
+    print(f"points in store: {store.count_chunks()}")
+    print()
+
+    def ids(query: str, mode: RetrievalMode) -> list[str]:
+        hits = retrieve_fn(
+            query, k, mode=mode, store=store, embedder=embedder, bm25_index=bm25_index
+        )
+        return [h.chunk_id for h in hits]
+
+    dense_empty = 0
+    hybrid_is_bm25 = 0
+    print(f"{'dense':>5} {'bm25':>5} {'hybr':>5}  fused?  probe")
+    for query in probes:
+        d, b, h = ids(query, "dense"), ids(query, "bm25"), ids(query, "hybrid")
+        if not d:
+            dense_empty += 1
+        fused = h != b
+        if not fused:
+            hybrid_is_bm25 += 1
+        print(f"{len(d):>5} {len(b):>5} {len(h):>5}  {'yes' if fused else 'NO ':>5}   {query}")
+
+    n = len(probes)
+    print()
+    print(f"dense returned nothing : {dense_empty}/{n}")
+    print(f"hybrid identical to bm25: {hybrid_is_bm25}/{n}")
+
+    failures = []
+    if dense_empty == n:
+        failures.append(
+            f"dense returned 0 results for all {n} probes -- the dense index is not being "
+            f"searched at all (corpus_version filter mismatch?), not merely underperforming"
+        )
+    if hybrid_is_bm25 == n:
+        failures.append(
+            f"hybrid's top-{k} was identical to bm25's for all {n} probes -- RRF is fusing "
+            f"one non-empty ranking, so hybrid is bm25 wearing a different name"
+        )
+    for message in failures:
+        print(f"FAIL  {message}")
+    if failures:
+        return 1
+    print("PASS  dense is alive and hybrid fuses two real rankings")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m services.rag")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -167,6 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
     retrieve_parser.add_argument(
         "--mode", choices=("dense", "bm25", "hybrid"), default="hybrid"
     )
+
+    diagnose_parser = subparsers.add_parser(
+        "diagnose", help="is dense retrieval alive, and does hybrid actually fuse?"
+    )
+    diagnose_parser.add_argument("--k", type=int, default=5)
 
     return parser
 
@@ -217,4 +303,6 @@ def main(
             embedder=embedder,
             bm25_index=bm25_index,
         )
+    elif args.command == "diagnose":
+        return _diagnose(store=store, embedder=embedder, bm25_index=bm25_index, k=args.k)
     return 0

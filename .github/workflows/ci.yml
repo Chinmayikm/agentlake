@@ -34,7 +34,7 @@ jobs:
       # exactly. Ruff enables 413 rules by default; without the explicit
       # select, upgrading ruff would silently change what CI rejects.
       - name: ruff
-        run: ruff check services/ tests/ stream/ scripts/ analytics/ quality/ metadata/
+        run: ruff check services/ tests/ stream/ scripts/ analytics/ quality/ metadata/ eval/
 
   test:
     runs-on: ubuntu-latest
@@ -305,6 +305,186 @@ jobs:
       - name: Registry logs on failure
         if: failure() && steps.detect.outputs.changed == 'true'
         run: docker compose logs schema-registry
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # The eval regression gate, in two jobs -- and the split is forced rather
+  # than stylistic. `secrets` is NOT available in a job-level `if:` (only
+  # `github`, `needs`, `vars` and `inputs` are), but it IS available in a
+  # step-level `env:`. So a preflight job turns "does the secret exist" into a
+  # boolean output that the gate job can then use in its `if:`.
+  #
+  # A fork PR has no secrets, so it gets a loud green notice and never a red X.
+  # That is deliberate: failing a contributor's PR because they cannot hold the
+  # maintainer's API key would be punishing them for the repo's configuration.
+  # The cost is stated rather than hidden -- eval paths CAN change without being
+  # gated, and ADR-008 #10's honest paragraph says so.
+  eval-preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      have_key: ${{ steps.key.outputs.have_key }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="origin/main"
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+
+      # services/gateway/ is in this list deliberately: a models.yaml edit or a
+      # passthrough change alters what the agent sends, and leaving it out is
+      # exactly the blind spot the honest paragraph would have to confess to.
+      - name: Did anything the eval measures change?
+        id: detect
+        run: |
+          base="${{ steps.base.outputs.ref }}"
+          paths="services/agent/ services/rag/ services/gateway/ eval/ metadata/sql/ .github/workflows/ci.yml"
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "Base $base does not resolve; running the gate to be safe."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base"...HEAD -- $paths | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only "$base"...HEAD -- $paths
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing the eval measures changed -- skipping."
+          fi
+
+      # -n "$KEY" never echoes the key itself.
+      - name: Is an API key available?
+        id: key
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Loud notice when the gate cannot run
+        if: steps.detect.outputs.changed == 'true' && steps.key.outputs.have_key != 'true'
+        run: |
+          echo "::notice title=eval-gate SKIPPED::Eval paths changed but no ANTHROPIC_API_KEY secret is available (fork PR?). These changes were NOT gated."
+          {
+            echo "### :warning: eval-gate skipped"
+            echo ""
+            echo "Eval paths changed, but no \`ANTHROPIC_API_KEY\` secret is available"
+            echo "to this run (fork PRs do not receive secrets). **These changes were"
+            echo "not gated.** A maintainer should run \`make eval-ci\` before merging."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  eval-gate:
+    needs: eval-preflight
+    if: needs.eval-preflight.outputs.changed == 'true' && needs.eval-preflight.outputs.have_key == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # The corpus, the real one. A sqlite CorpusStore would be faster, but it
+      # is exact brute-force cosine where Qdrant is approximate HNSW, so its
+      # top-5 can differ -- CI would need its own baseline and neither number
+      # would be the production one. It also has no corpus_version filter, so
+      # the exact bug class ADR-008 #1 fixes would stay untested in the one
+      # place it should be caught.
+      #
+      # What IS cached is the slow, network-flaky half: three sparse clones of
+      # apache/kafka, apache/flink and apache/iceberg.
+      - name: Cache the fetched docs
+        uses: actions/cache@v4
+        with:
+          path: services/rag/data/raw
+          key: rag-raw-${{ hashFiles('services/rag/sources.yaml') }}
+
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: services/rag/data/models
+          key: fastembed-bge-small-en-v1.5
+
+      - name: Start qdrant and the metadata database
+        run: |
+          docker compose --profile rag up -d qdrant
+          docker compose --profile cdc up -d metadata-db metadata-init
+
+      # Resume-aware, so with the raw docs cached this only re-embeds.
+      - name: Ingest the corpus
+        run: python -m services.rag ingest
+
+      # Its own step, and loud. A partial ingest otherwise shows up as a lower
+      # hit rate and reads as a quality regression rather than as a truncated
+      # corpus.
+      - name: Assert the corpus is complete
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from services.rag.qdrant_store import default_store
+          count = default_store().count_chunks()
+          print(f"corpus holds {count} chunks")
+          if count < 1400:
+              print(f"::error::corpus is incomplete ({count} chunks); refusing to score against it")
+              raise SystemExit(1)
+          PY
+
+      # The permanent guard for ADR-008 #1: dense alive, hybrid actually fusing.
+      - name: Retrieval preflight
+        run: python -m services.rag diagnose
+
+      - name: Publish the prompts and the golden set
+        run: |
+          python scripts/load_prompts.py
+          python -m eval load-golden
+
+      - name: Start the gateway
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m uvicorn services.gateway.app:create_app --factory --port 8100 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8100/v1/health >/dev/null; then
+              echo "gateway ready after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "gateway did not come up within 60s" >&2
+          exit 1
+
+      # No Kafka here, deliberately: span emits fail and are swallowed
+      # (ADR-000), so the CI run is untraced -- which is exactly why
+      # --hit-source observed is the default rather than the fallback.
+      #
+      # Exit 1 is a quality regression; exit 3 is a harness failure. Both fail
+      # the job, but the distinction is in the log rather than lost.
+      - name: Run the gate
+        env:
+          AGENTLAKE_EVAL_CONFIRM: "1"
+        run: python -m eval run --subset ci --gate --yes --concurrency 3 --label "eval-gate"
 
       - name: Tear down
         if: always()

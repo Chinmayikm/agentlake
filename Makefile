@@ -1,4 +1,7 @@
-.PHONY: gateway traces \
+.PHONY: test lint gateway traces rag-preflight prompts-load prompts-load-dry \
+        eval-validate eval-corpus-paths eval-ab eval-load eval-pilot eval \
+        eval-ci eval-baseline eval-baseline-from eval-gate eval-label \
+        eval-agreement eval-ledger \
         flink-jars stream-up stream-down flink-tables flink-jobs flink-resume \
         flink-stop flink-verify flink-shell traffic \
         hot-up hot-down ch-tables ch-verify ch-freshness ch-panels ch-sample \
@@ -9,11 +12,140 @@
         cdc-up cdc-down cdc-connector cdc-psql cdc-slot cdc-topic \
         cdc-table cdc-land cdc-seed
 
+# The path list here and the one in .github/workflows/ci.yml's ruff step are
+# asserted identical by tests/test_repo_hygiene.py -- "CI matches local
+# reality" only holds if the two cannot drift.
+LINT_PATHS = services/ tests/ stream/ scripts/ analytics/ quality/ metadata/ eval/
+
+test:
+	.venv/bin/python3 -m pytest -q
+
+lint:
+	.venv/bin/ruff check $(LINT_PATHS)
+
 gateway:
 	.venv/bin/uvicorn services.gateway.app:create_app --factory --reload --port 8100
 
 traces:
 	.venv/bin/python3 scripts/consume_tree.py
+
+# Is dense retrieval alive, and is hybrid actually fusing two rankings? Needs
+# qdrant up and the corpus ingested. Exits non-zero on either failure -- the
+# permanent guard for ADR-008 #1, where dense returned nothing for months and
+# hybrid was BM25-only, with no error anywhere.
+rag-preflight:
+	.venv/bin/python3 -m services.rag diagnose
+
+# --- eval harness (ADR-008) ------------------------------------------------
+#
+# Publish services/agent/prompts/*.md into prompt_versions. One direction only:
+# the files are the source of truth, and nothing reads template_text back into
+# the agent (ADR-007 #6). Needs metadata-db up (`make cdc-up`); re-running is a
+# genuine no-op, emitting no WAL and therefore no spurious CDC update.
+prompts-load:
+	.venv/bin/python3 scripts/load_prompts.py
+
+prompts-load-dry:
+	.venv/bin/python3 scripts/load_prompts.py --dry-run
+
+# Load and validate the golden set: closed-vocabulary tags, a stratified CI
+# subset of exactly 25, and -- the one that matters -- every expected_source
+# and written_from resolving to a real corpus document. An unresolvable prefix
+# scores hit@k = 0 forever and reads as a retrieval regression rather than as
+# the typo it is. Free, no services needed.
+eval-validate:
+	.venv/bin/python3 -m eval validate
+
+# Regenerate eval/golden/corpus_paths.txt from the live corpus. Needs qdrant.
+# Committed so eval-validate and the test suite need no Qdrant.
+eval-corpus-paths:
+	.venv/bin/python3 -m eval corpus-paths
+
+# Retrieval-only A/B across dense/bm25/hybrid over the WHOLE golden set.
+# Needs qdrant and nothing else -- no gateway, no Kafka, no API key, NO COST.
+# `--corpus-version unknown` reproduces the pre-ADR-008 bug exactly, which is
+# how docs/eval/retrieval_ab.md's before/after pair is measured.
+eval-ab:
+	.venv/bin/python3 -m eval ab --out docs/eval/retrieval_ab.md
+
+# Publish eval/golden/*.yaml into golden_examples. Free; needs metadata-db.
+# Never deletes: eval_results FK-reference these rows, so an orphan is reported
+# and left alone rather than removed.
+eval-load:
+	.venv/bin/python3 -m eval load-golden
+
+# ---------------------------------------------------------------------------
+# THE TARGETS BELOW SPEND REAL MONEY.
+# ---------------------------------------------------------------------------
+#
+# Every one of them prints an estimate, refuses to start if the ledger says it
+# cannot finish inside the cap, checks after every example, and appends what it
+# actually cost to eval/.spend.json (gitignored). Cost figures come from the
+# gateway's own /v1/stats, which is the only thing in this repo entitled to
+# compute them.
+#
+# They need, all at once: kafka + schema-registry (span emit), qdrant
+# (retrieval), metadata-db (results), and `make gateway` in another shell.
+# STOP the streaming and analytics slices first -- see ADR-008's runbook.
+#
+# A pilot first. Three examples, so the projected per-example cost is measured
+# rather than assumed before a 25-example run is authorised:
+#   make eval-pilot
+eval-pilot:
+	.venv/bin/python3 -m eval run --subset ci --limit 3 --label "pilot" --yes
+
+# The full 85-example set. DEFERRED under the current budget -- every published
+# run number is the 25-example CI subset. Left here because it is the command,
+# not because it has been run.
+eval:
+	.venv/bin/python3 -m eval run --subset all --label "full run"
+
+# The 25-example CI subset, compared against eval/baseline.json. This is what
+# the eval-gate CI job runs. Exit 1 = quality regression; exit 3 = harness
+# failure -- different problems, different exit codes.
+eval-ci:
+	.venv/bin/python3 -m eval run --subset ci --gate --require-clean --yes --label "eval-ci"
+
+# Two identical runs -> eval/baseline.json. Refuses a dirty tree: a baseline
+# pinned to a commit nobody can check out is not a baseline.
+eval-baseline:
+	.venv/bin/python3 -m eval baseline --subset ci --yes
+
+# Free again from here.
+#
+# Rebuild eval/baseline.json from runs ALREADY in the metadata database, with
+# no API calls at all: make eval-baseline-from RUNS="3 4". One run id gives a
+# single-run baseline with declared thresholds, two give the sigma-derived
+# ones. This is how the checked-in baseline was made -- run 4 aborted, so
+# re-running for sigma would have cost another $1.20 (ADR-008 #14).
+eval-baseline-from:
+	.venv/bin/python3 -m eval baseline --from-runs $(RUNS)
+
+# Gate a run that already happened against eval/baseline.json. Free -- it reads
+# eval_results, it does not produce them, so re-checking a threshold costs
+# nothing where re-running would cost ~$1. Defaults to the latest finished run;
+# `make eval-gate RUN=3` picks one.
+#   exit 0 pass  |  1 regression or config drift  |  2 cannot compare  |  3 harness failure
+#
+# Those four codes survive the module, NOT this target: make exits 2 for any
+# failed recipe, which would collapse "regression" and "harness failure" into
+# one number. CI calls `python -m eval gate` directly for that reason.
+eval-gate:
+	.venv/bin/python3 -m eval gate --run $(or $(RUN),latest)
+
+#
+# Emit a stratified 30-row hand-labelling sheet from the most recent completed
+# run. The judge's own score is deliberately absent from it.
+eval-label:
+	.venv/bin/python3 -m eval label --run latest --n 30
+
+# Score a filled sheet: make eval-agreement SHEET=docs/eval/labels/run-N.csv
+eval-agreement:
+	.venv/bin/python3 -m eval agreement --sheet $(SHEET)
+
+# What has been spent so far, and what is left.
+eval-ledger:
+	@.venv/bin/python3 -c "from eval.budget import Ledger; print(Ledger.load().render())"
 
 # --- cold path: Kafka -> Flink SQL -> Iceberg (ADR-004) ---------------------
 #

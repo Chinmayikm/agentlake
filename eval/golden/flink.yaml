@@ -1,0 +1,355 @@
+# Golden examples for the pinned Flink 1.20 corpus.
+#
+# Pinned directories (services/rag/sources.yaml): docs/content/docs/concepts,
+# docs/content/docs/deployment and docs/content/docs/ops -- 81 documents, the
+# largest of the three projects. Note what is NOT pinned: docs/dev/, so the
+# DataStream and Table/SQL APIs and every connector are outside the corpus.
+#
+# AUTHORING RULE (ADR-008): every question was written FROM the file named in
+# `written_from`, before retrieval was run against it.
+
+dataset_version: v1
+project: flink
+
+examples:
+  # --- time and watermarks -------------------------------------------------
+  - key: flink-time-001
+    question: "What is the difference between event time and processing time in Flink?"
+    expected_answer: >
+      Processing time is the system clock of the machine running the operator:
+      simple, lowest latency, no coordination needed, but not deterministic
+      because it depends on how fast records arrive and flow. Event time is the
+      time the event occurred on its producing device, carried in the record
+      itself, so progress depends on the data rather than on any wall clock --
+      which is what makes results reproducible across replays.
+    expected_sources: [docs/content/docs/concepts/time.md]
+    written_from: "docs/content/docs/concepts/time.md#Notions of Time: Event Time and Processing Time"
+    difficulty: easy
+    type: conceptual
+
+  - key: flink-watermark-001
+    question: "What exactly does a watermark assert?"
+    expected_answer: >
+      A Watermark(t) flowing in the stream declares that event time has reached
+      t in that stream -- that no further element should arrive with a timestamp
+      t' <= t. When it reaches an operator, the operator advances its internal
+      event time clock to t, which is how a window operator learns it may close
+      the window it has been building.
+    expected_sources: [docs/content/docs/concepts/time.md]
+    written_from: "docs/content/docs/concepts/time.md#Event Time and Watermarks"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-watermark-002
+    question: "Where do watermarks come from in a parallel job, and how do they move through it?"
+    expected_answer: >
+      They are generated at, or directly after, the source functions, with each
+      parallel subtask of the source generating its own independently -- so each
+      defines the event time at that particular parallel source. As they flow
+      downstream they advance the event time at each operator they reach, and an
+      operator that advances its clock emits a new watermark to its successors.
+    expected_sources: [docs/content/docs/concepts/time.md]
+    written_from: "docs/content/docs/concepts/time.md#Event Time and Watermarks > Watermarks in Parallel Streams"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-watermark-003
+    question: "Why not just delay watermarks a long time so no event is ever late?"
+    expected_answer: >
+      Because delaying watermarks delays the evaluation of every event time
+      window by the same amount. In practice elements can be arbitrarily
+      delayed, so there is often no bound that guarantees completeness anyway --
+      which is why Flink lets programs expect late elements and handle them with
+      allowed lateness instead.
+    expected_sources: [docs/content/docs/concepts/time.md]
+    written_from: "docs/content/docs/concepts/time.md#Lateness"
+    difficulty: hard
+    type: conceptual
+
+  - key: flink-window-001
+    question: "What kinds of windows does Flink distinguish?"
+    expected_answer: >
+      Windows can be time driven (every 30 seconds) or data driven (every 100
+      elements), and the usual types are tumbling windows with no overlap,
+      sliding windows with overlap, and session windows punctuated by a gap of
+      inactivity.
+    expected_sources: [docs/content/docs/concepts/time.md]
+    written_from: "docs/content/docs/concepts/time.md#Windowing"
+    difficulty: easy
+    type: factual
+    ci: true
+
+  # --- architecture --------------------------------------------------------
+  - key: flink-slots-001
+    question: "What does a task slot actually isolate between jobs?"
+    expected_answer: >
+      Managed memory, and only that. A TaskManager with three slots dedicates a
+      third of its managed memory to each, so a subtask has reserved memory
+      rather than competing for it -- but there is no CPU isolation between
+      slots.
+    expected_sources: [docs/content/docs/concepts/flink-architecture.md]
+    written_from: "docs/content/docs/concepts/flink-architecture.md#Task Slots and Resources"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-slots-002
+    question: "How many task slots does my cluster need for a job with mixed parallelism?"
+    expected_answer: >
+      Exactly as many as the highest parallelism used in the job. Flink lets
+      subtasks of different tasks from the same job share a slot by default, so
+      one slot can hold an entire pipeline -- which removes the need to total up
+      tasks of varying parallelism and improves utilisation, since light
+      source/map subtasks no longer reserve as much as heavy window subtasks.
+    expected_sources: [docs/content/docs/concepts/flink-architecture.md]
+    written_from: "docs/content/docs/concepts/flink-architecture.md#Task Slots and Resources"
+    difficulty: medium
+    type: conceptual
+
+  # --- checkpoints and savepoints -----------------------------------------
+  - key: flink-checkpoint-001
+    question: "What is the difference between a checkpoint and a savepoint?"
+    expected_answer: >
+      Roughly the difference between a recovery log and a backup. Checkpoints
+      exist to recover from unexpected failures; Flink creates, owns and deletes
+      them, they are optimised to be cheap to take and fast to restore, and they
+      are written in a state-backend-specific native format. Savepoints are
+      created, owned and deleted solely by the user, for planned operations like
+      a Flink upgrade or a job graph change, and are written in a canonical,
+      backend-independent format that is more expensive to produce and restore.
+    expected_sources: [docs/content/docs/ops/state/checkpoints_vs_savepoints.md]
+    written_from: "docs/content/docs/ops/state/checkpoints_vs_savepoints.md#Overview"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-checkpoint-002
+    question: "I cancelled my job and the checkpoints disappeared. Is that expected?"
+    expected_answer: >
+      Yes. Checkpoints are not retained by default -- they exist to resume from
+      failure and are deleted when the program is cancelled. Configuring
+      ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION keeps them, at the
+      cost of having to clean up the checkpoint state by hand afterwards;
+      DELETE_ON_CANCELLATION keeps them only when the job fails.
+    expected_sources: [docs/content/docs/ops/state/checkpoints.md]
+    written_from: "docs/content/docs/ops/state/checkpoints.md#Retained Checkpoints"
+    difficulty: medium
+    type: config
+
+  - key: flink-checkpoint-003
+    question: "What does unaligned checkpointing change, and when is it worth turning on?"
+    expected_answer: >
+      A barrier is allowed to overtake in-flight data, with that data becoming
+      part of the operator's state -- the operator reacts to the first barrier
+      in its input buffers, immediately forwards it downstream, and marks the
+      overtaken records to be stored asynchronously. It is closer to
+      Chandy-Lamport, though Flink still injects barriers at the sources. It
+      suits jobs with at least one slow data path where alignment can take
+      hours, but it adds I/O pressure and does not help when the bottleneck is
+      already I/O to the state store.
+    expected_sources: [docs/content/docs/concepts/stateful-stream-processing.md]
+    written_from: "docs/content/docs/concepts/stateful-stream-processing.md#State Persistence > Unaligned Checkpointing"
+    difficulty: hard
+    type: conceptual
+
+  - key: flink-checkpoint-004
+    question: "If I switch checkpointing to at-least-once, does my map-and-filter-only job start producing duplicates?"
+    expected_answer: >
+      No. Alignment only happens at operators with multiple predecessors (joins)
+      or multiple senders (after a repartition or shuffle), so a dataflow of
+      embarrassingly parallel operations like map, flatMap and filter still
+      gives exactly-once guarantees even in at-least-once mode.
+    expected_sources: [docs/content/docs/concepts/stateful-stream-processing.md]
+    written_from: "docs/content/docs/concepts/stateful-stream-processing.md#State Persistence > Exactly Once vs. At Least Once"
+    difficulty: hard
+    type: conceptual
+
+  - key: flink-checkpoint-005
+    question: "Which configuration option turns checkpointing on?"
+    expected_answer: >
+      execution.checkpointing.interval -- it is the base interval, and
+      checkpointing is enabled by setting it to a value greater than 0.
+    expected_sources: [docs/content/docs/deployment/config.md]
+    written_from: "docs/content/docs/deployment/config.md#Common Setup Options"
+    difficulty: easy
+    type: config
+    ci: true
+
+  - key: flink-savepoint-001
+    question: "I want to move a job from RocksDB to the heap state backend. Which kind of snapshot do I have to restore from?"
+    expected_answer: >
+      A canonical savepoint. Changing the state backend is supported only from
+      canonical savepoints -- not from native savepoints, and not from aligned
+      or unaligned checkpoints.
+    expected_sources: [docs/content/docs/ops/state/checkpoints_vs_savepoints.md]
+    written_from: "docs/content/docs/ops/state/checkpoints_vs_savepoints.md#Capabilities and limitations"
+    difficulty: hard
+    type: factual
+    ci: true
+
+  # --- state backends ------------------------------------------------------
+  - key: flink-state-001
+    question: "Should I use the HashMap state backend or RocksDB?"
+    expected_answer: >
+      It is a choice between performance and scalability. HashMapStateBackend
+      keeps state as objects on the JVM heap, so every access is fast, but the
+      state size is bounded by cluster memory. EmbeddedRocksDBStateBackend
+      scales with available disk space and is the only backend supporting
+      incremental checkpoints, but every access goes through
+      (de)serialisation and possibly disk, making it on average an order of
+      magnitude slower.
+    expected_sources: [docs/content/docs/ops/state/state_backends.md]
+    written_from: "docs/content/docs/ops/state/state_backends.md#Choose The Right State Backend"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-state-002
+    question: "Is there a size limit on a single key or value in the RocksDB state backend?"
+    expected_answer: >
+      Yes -- RocksDB's JNI bridge is byte[]-based, so the maximum supported size
+      is 2^31 bytes per key and per value. States using RocksDB merge
+      operations, such as ListState, can silently accumulate past that and then
+      fail on the next retrieval.
+    expected_sources: [docs/content/docs/ops/state/state_backends.md]
+    written_from: "docs/content/docs/ops/state/state_backends.md#The EmbeddedRocksDBStateBackend"
+    difficulty: hard
+    type: factual
+    ci: true
+
+  - key: flink-state-003
+    question: "Which configuration option selects the state backend?"
+    expected_answer: >
+      state.backend.type, whose common values are hashmap and rocksdb.
+    expected_sources: [docs/content/docs/deployment/config.md]
+    written_from: "docs/content/docs/deployment/config.md#Common Setup Options"
+    difficulty: easy
+    type: config
+
+  # --- failure recovery ----------------------------------------------------
+  - key: flink-restart-001
+    question: "If I enable checkpointing but never configure a restart strategy, what does Flink do on failure?"
+    expected_answer: >
+      It uses the exponential delay restart strategy, which is the current
+      default when checkpointing is enabled and no strategy is specified.
+    expected_sources: [docs/content/docs/ops/state/task_failure_recovery.md]
+    written_from: "docs/content/docs/ops/state/task_failure_recovery.md#Restart Strategies > Default restart strategy"
+    difficulty: medium
+    type: config
+
+  - key: flink-restart-002
+    question: "Why is an exponential delay restart strategy recommended over a fixed delay?"
+    expected_answer: >
+      A fixed delay is wrong in both directions: too short and frequent failures
+      hammer external services -- the docs give many Flink jobs all retrying a
+      crashed Kafka cluster at once as an avalanche -- while too long hurts
+      availability when failures are only occasional. Exponential delay starts
+      short so occasional failures recover quickly and backs off as failures
+      repeat, and its jitter-factor spreads identically configured jobs so they
+      do not restart in lockstep.
+    expected_sources: [docs/content/docs/ops/state/task_failure_recovery.md]
+    written_from: "docs/content/docs/ops/state/task_failure_recovery.md#Restart Strategies > Default restart strategy"
+    difficulty: medium
+    type: conceptual
+
+  - key: flink-failover-001
+    question: "When one task fails, does Flink have to restart the whole job?"
+    expected_answer: >
+      Not with the pipelined region failover strategy, which groups tasks into
+      disjoint regions -- sets of tasks communicating over pipelined exchanges,
+      with batch exchanges forming the boundaries -- and restarts the smallest
+      set of regions needed to recover. For some jobs that is far fewer tasks
+      than the restart-all strategy.
+    expected_sources: [docs/content/docs/ops/state/task_failure_recovery.md]
+    written_from: "docs/content/docs/ops/state/task_failure_recovery.md#Failover Strategies > Restart Pipelined Region Failover Strategy"
+    difficulty: medium
+    type: conceptual
+    ci: true
+
+  # --- running it in production -------------------------------------------
+  - key: flink-production-001
+    question: "Why should I set max parallelism explicitly, and what values are allowed?"
+    expected_answer: >
+      Because it cannot be changed after the job starts without discarding that
+      operator's state. It bounds how far a stateful operator can be rescaled,
+      and Flink keeps rescaling metadata that grows linearly with it, so it
+      trades future scalability against performance and state size. The
+      constraint is 0 < parallelism <= max parallelism <= 2^15; left unset,
+      Flink derives it at first start as 128 for parallelism <= 128, otherwise
+      MIN(nextPowerOfTwo(parallelism + parallelism/2), 2^15).
+    expected_sources: [docs/content/docs/ops/production_ready.md]
+    written_from: "docs/content/docs/ops/production_ready.md#Set An Explicit Max Parallelism"
+    difficulty: hard
+    type: config
+    ci: true
+
+  - key: flink-production-002
+    question: "Why does every operator need an explicit uid before I rely on savepoints?"
+    expected_answer: >
+      Because uids are how Flink maps saved operator state back to operators.
+      Left to itself Flink generates them by hashing operator properties while
+      traversing the JobGraph, which is fragile: changing the graph -- swapping
+      an operator, for instance -- produces new ids and breaks the mapping.
+      setUid(String) gives a stable one.
+    expected_sources: [docs/content/docs/ops/production_ready.md]
+    written_from: "docs/content/docs/ops/production_ready.md#Set UUIDs For All Operators"
+    difficulty: medium
+    type: conceptual
+
+  # --- monitoring ----------------------------------------------------------
+  - key: flink-backpressure-001
+    question: "The web UI shows High back pressure on my Source. What is actually wrong?"
+    expected_answer: >
+      The Source is producing faster than its downstream operators can consume,
+      and back pressure propagates upstream against the flow of records. In a
+      Source -> Sink job, a warning on Source means the Sink is the slow one and
+      is back pressuring it -- so the problem is downstream of where the warning
+      appears.
+    expected_sources: [docs/content/docs/ops/monitoring/back_pressure.md]
+    written_from: "docs/content/docs/ops/monitoring/back_pressure.md#Back Pressure"
+    difficulty: medium
+    type: conceptual
+    ci: true
+
+  - key: flink-backpressure-002
+    question: "Which metrics tell me whether a subtask is back pressured, idle or busy, and how should I read them?"
+    expected_answer: >
+      backPressuredTimeMsPerSecond, idleTimeMsPerSecond and
+      busyTimeMsPerSecond, which add up to about 1000 ms at any point. They are
+      averaged over the last few seconds, so a subtask at a constant 50% load
+      and one alternating each second between full and idle both report roughly
+      500 ms busy. Internally back pressure is judged by whether output buffers
+      are available, and idleness by whether input is available.
+    expected_sources: [docs/content/docs/ops/monitoring/back_pressure.md]
+    written_from: "docs/content/docs/ops/monitoring/back_pressure.md#Task performance metrics"
+    difficulty: hard
+    type: factual
+
+  # --- memory --------------------------------------------------------------
+  - key: flink-memory-001
+    question: "What is the difference between taskmanager.memory.process.size and taskmanager.memory.flink.size?"
+    expected_answer: >
+      Total process memory is the whole JVM process footprint -- what a
+      container limit has to accommodate -- while total Flink memory is the part
+      Flink itself manages, excluding JVM overheads such as metaspace. The
+      jobmanager.memory.* options are the equivalents for the JobManager.
+    expected_sources: [docs/content/docs/deployment/memory/mem_setup.md]
+    written_from: "docs/content/docs/deployment/memory/mem_setup.md#Configure Total Memory"
+    difficulty: medium
+    type: config
+    ci: true
+
+  # --- deliberately unanswerable ------------------------------------------
+  # Only concepts/, deployment/ and ops/ are pinned -- docs/dev/ is not, so no
+  # connector documentation is in the corpus at all. This one is a trap for a
+  # model answering from pre-training rather than from what it retrieved, which
+  # is exactly what the faithfulness scale is meant to catch.
+  - key: flink-unanswerable-001
+    question: "What is the Flink SQL DDL for a Pulsar source table?"
+    expected_answer: >
+      The pinned corpus does not cover this. It contains Flink's concepts,
+      deployment and operations documentation; connector and SQL DDL
+      documentation lives under docs/dev/, which is not part of the pinned set.
+    expected_sources: []
+    written_from: "(not in the corpus)"
+    answerable: false
+    difficulty: medium
+    type: factual
+    ci: true
