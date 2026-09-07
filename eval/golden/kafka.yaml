@@ -65,7 +65,12 @@ examples:
       read from; a read starting there simply returns the next message that is
       still present. Compaction also never reorders messages.
     expected_sources: [docs/design.html]
-    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics"
+    # Same section as -002, deliberately: Log Compaction Basics carries two
+    # independent facts. This one is the offset-stability paragraph ("the
+    # offset for a message never changes... 36, 37, 38 are all equivalent
+    # positions"), which is a model question -- you cannot answer it by
+    # quoting a value. -002 is the tombstone paragraph, which you can.
+    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics > offsets are permanent positions"
     difficulty: medium
     type: conceptual
 
@@ -76,7 +81,10 @@ examples:
       null-payload record as a tombstone, which marks the key as deleted from
       the log.
     expected_sources: [docs/design.html]
-    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics"
+    # The tombstone paragraph of the same section -- see -001. A single
+    # retrievable fact (null payload == delete marker), hence factual/easy
+    # against -001's conceptual/medium.
+    written_from: "docs/design.html#4.8 Log Compaction > Log Compaction Basics > tombstones (null payload)"
     difficulty: easy
     type: factual
     ci: true
